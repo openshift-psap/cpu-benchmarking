@@ -1,0 +1,68 @@
+{
+  "experiment": "vllm-cpu-study-psap",
+  "mlflow_tags": { "project": "cpu-isolation" },
+  "defaults": {
+    "server_numa": 1,
+    "client_numa": 0,
+    "max_seconds": 300,
+    "vllm_extra_args": "--dtype=bfloat16 --max-num-batched-tokens 4096",
+    "container_env": {
+      "VLLM_CPU_OMP_THREADS_BIND": "auto",
+      "VLLM_CPU_NUM_OF_RESERVED_CPU": "1",
+      "CPU_VISIBLE_MEMORY_NODES": "1",
+      "HF_HUB_OFFLINE": "1"
+    }
+  },
+  "runs": [
+    {
+      "run_name": "qwen-qwen3-4b-kv64-c32-isl16-osl32-mnbs4096-socket1",
+      "model": "Qwen/Qwen3-4B",
+      "kv_cache_gb": 64,
+      "isl": 16,
+      "osl": 32,
+      "rate": "1,2,4,8,16,32,64,128,256",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "kvcache-64gb-singlesocket","model": "Qwen3-4B","CPU": "Intel","SKU": "SPR","image":"RHAIIS-3.4-GA-downstream" }
+    },
+    {
+      "run_name": "qwen-qwen3-4b-kv64-c32-isl16-osl64-mnbs4096-socket1",
+      "model": "Qwen/Qwen3-4B",
+      "kv_cache_gb": 64,
+      "isl": 16,
+      "osl": 64,
+      "rate": "1,2,4,8,16,32,64,128,256",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "kvcache-64gb-singlesocket","model": "Qwen3-4B","CPU": "Intel","SKU": "SPR","image":"RHAIIS-3.4-GA-downstream" }
+    },
+    {
+      "run_name": "qwen-qwen3-4b-kv64-c32-isl16-osl128-mnbs4096-socket1",
+      "model": "Qwen/Qwen3-4B",
+      "kv_cache_gb": 64,
+      "isl": 16,
+      "osl": 128,
+      "rate": "1,2,4,8,16,32,64,128,256",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "kvcache-64gb-singlesocket","model": "Qwen3-4B","CPU": "Intel","SKU": "SPR","image":"RHAIIS-3.4-GA-downstream" }
+    },
+    {
+      "run_name": "qwen-qwen3-4b-kv64-c32-isl16-osl256-mnbs4096-socket1",
+      "model": "Qwen/Qwen3-4B",
+      "kv_cache_gb": 64,
+      "isl": 16,
+      "osl": 256,
+      "rate": "1,2,4,8,16,32,64,128,256",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "kvcache-64gb-singlesocket","model": "Qwen3-4B","CPU": "Intel","SKU": "SPR","image":"RHAIIS-3.4-GA-downstream" }
+    },
+    {
+      "run_name": "qwen-qwen3-4b-kv64-c32-isl16-osl512-mnbs4096-socket1",
+      "model": "Qwen/Qwen3-4B",
+      "kv_cache_gb": 64,
+      "isl": 16,
+      "osl": 512,
+      "rate": "1,2,4,8,16,32,64,128,256",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "kvcache-64gb-singlesocket","model": "Qwen3-4B","CPU": "Intel","SKU": "SPR","image":"RHAIIS-3.4-GA-downstream" }
+    }
+  ]
+}

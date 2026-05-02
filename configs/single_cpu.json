@@ -1,0 +1,106 @@
+{
+  "experiment": "vllm-cpu-study-llama",
+  "mlflow_tags": { "project": "cpu-isolation" },
+  "defaults": {
+    "server_numa": 1,
+    "client_numa": 0,
+    "max_seconds": 300,
+    "vllm_extra_args": "--dtype=bfloat16 --max-num-batched-tokens 4096",
+      "container_env": {
+         "VLLM_CPU_OMP_THREADS_BIND": "65",
+         "VLLM_CPU_NUM_OF_RESERVED_CPU": "1",
+         "CPU_VISIBLE_MEMORY_NODES": "1",
+          "HF_HUB_OFFLINE": "1"
+      }
+  },
+  "runs": [
+    {
+      "run_name": "qwen-kv128-c0-isl16-osl1-mnbs4096",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "kv_cache_gb": 128,
+      "server_cpulist": "65,67,69",
+      "isl": 16,
+      "osl": 1,
+      "rate": "1,2,4",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "single-cpu-prefill-intel-socket1","variant": "isl-16-osl-1" }
+    },
+    {
+      "run_name": "qwen-kv128-c0-isl32-osl1-mnbs4096",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "kv_cache_gb": 128,
+      "server_cpulist": "65,67,69",
+      "isl": 32,
+      "osl": 1,
+      "rate": "1,2,4",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "single-cpu-prefill-intel-socket1","variant": "isl-32-osl-1" }
+    },
+    {
+      "run_name": "qwen-kv128-c0-isl64-osl1-mnbs4096",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "kv_cache_gb": 128,
+      "server_cpulist": "65,67,69",
+      "isl": 64,
+      "osl": 1,
+      "rate": "1,2,4",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "single-cpu-prefill-intel-socket1","variant": "isl-64-osl-1" }
+    },
+    {
+      "run_name": "qwen-kv128-c0-isl128-osl1-mnbs4096",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "kv_cache_gb": 128,
+      "server_cpulist": "65,67,69",
+      "isl": 128,
+      "osl": 1,
+      "rate": "1,2,4",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "single-cpu-prefill-intel-socket1","variant": "isl-128-osl-1" }
+    },
+    {
+      "run_name": "qwen-kv128-c0-isl256-osl1-mnbs4096",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "kv_cache_gb": 128,
+      "server_cpulist": "65,67,69",
+      "isl": 256,
+      "osl": 1,
+      "rate": "1,2,4",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "single-cpu-prefill-intel-socket1","variant": "isl-256-osl-1" }
+    },
+    {
+      "run_name": "qwen-kv128-c0-isl512-osl1-mnbs4096",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "kv_cache_gb": 128,
+      "server_cpulist": "65,67,69",
+      "isl": 512,
+      "osl": 1,
+      "rate": "1,2,4",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "single-cpu-prefill-intel-socket1","variant": "isl-512-osl-1" }
+    },
+    {
+      "run_name": "qwen-kv128-c0-isl1024-osl1-mnbs4096",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "kv_cache_gb": 128,
+      "server_cpulist": "65,67,69",
+      "isl": 1024,
+      "osl": 1,
+      "rate": "1,2,4",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "single-cpu-prefill-intel-socket1","variant": "isl-1024-osl-1" }
+    },
+    {
+      "run_name": "qwen-kv128-c0-isl2048-osl1-mnbs4096",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "kv_cache_gb": 128,
+      "server_cpulist": "65,67,69",
+      "isl": 2048,
+      "osl": 1,
+      "rate": "1,2,4",
+      "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 4096",
+      "mlflow_tags": { "project": "single-cpu-prefill-intel-socket1","variant": "isl-2048-osl-1" }
+    }
+  ]
+}
