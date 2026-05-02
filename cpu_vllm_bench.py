@@ -3,11 +3,11 @@
 vLLM (Podman) + GuideLLM benchmark orchestrator.
 
 Execution order per run:
-  1. Start container, sample metrics, run GuideLLM, stop container (writes ``run_config.json`` from the suite/CLI config).
+  1. Start container (after printing a podman launch preview), sample metrics, run GuideLLM, stop container (writes ``run_config.json`` from the suite/CLI config).
   2. Dashboard CSV: always write ``dashboard_benchmark.csv`` when GuideLLM JSON exists, then optional concurrency graphs (PNG); optionally append to ``--dashboard-csv``. If ``mlflow_tags`` includes ``project``, it is appended to ``--dashboard-version`` for the performance-dashboard import script.
   3. Optional: single MLflow upload (tags, params, metrics, artifacts) — last step only.
 
-See README.md in this repository for setup and examples.
+See README.md for setup and examples; README_CODE.md for code paths.
 
 Multiple suite files: pass ``--config`` more than once; each file is run to completion in order.
 """
@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -393,6 +394,95 @@ def run_podman_detached(*, run_podman_sh: Path, env: dict[str, str]) -> None:
         check=True,
         cwd=str(run_podman_sh.parent),
     )
+
+
+def _podman_run_argv_from_env(e: dict[str, str], *, runtime: str) -> list[str]:
+    """Rebuild the ``podman|docker run ...`` argv (mirrors ``run_podman.sh``; omits file expansions)."""
+    parts: list[str] = [
+        runtime,
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        "--security-opt",
+        "seccomp=unconfined",
+        "--security-opt=label=disable",
+        "--cap-add",
+        "SYS_NICE",
+        f"--shm-size={e['SHM_SIZE']}",
+        "-p",
+        f"{e['PORT']}:8000",
+        "--name",
+        e["CONTAINER_NAME"],
+        "-e",
+        f"VLLM_CPU_KVCACHE_SPACE={e['VLLM_CPU_KVCACHE_SPACE']}",
+        "-e",
+        f"VLLM_CPU_OMP_THREADS_BIND={e['VLLM_CPU_OMP_THREADS_BIND']}",
+        "-e",
+        f"HF_HOME={e['HF_HOME_CONTAINER']}",
+    ]
+    if e.get("REPLACE_CONTAINER") == "1" and runtime == "podman":
+        parts.append("--replace")
+    if e.get("DETACHED") == "1":
+        parts.append("-d")
+    if e.get("CPU_VISIBLE_MEMORY_NODES"):
+        parts += ["-e", f"CPU_VISIBLE_MEMORY_NODES={e['CPU_VISIBLE_MEMORY_NODES']}"]
+    if e.get("OMP_NUM_THREADS"):
+        parts += ["-e", f"OMP_NUM_THREADS={e['OMP_NUM_THREADS']}"]
+    parts += ["-v", e["HF_HOME"]]
+    if str(e.get("VLLM_USE_IMAGE_ENTRYPOINT", "0")) == "1":
+        parts += [e["VLLM_IMAGE"], e["MODEL"]]
+    else:
+        parts += ["--entrypoint", "vllm", e["VLLM_IMAGE"], "serve", e["MODEL"]]
+    extra = (e.get("VLLM_EXTRA_ARGS") or "").strip()
+    if extra:
+        parts.extend(shlex.split(extra))
+    return parts
+
+
+def _numactl_launch_prefix_argv(e: dict[str, str]) -> list[str]:
+    n = str(e["SERVER_NUMA_NODE"])
+    out = ["numactl", f"--cpunodebind={n}", f"--membind={n}"]
+    if e.get("SERVER_CPULIST"):
+        return ["taskset", "-c", str(e["SERVER_CPULIST"]), *out]
+    return out
+
+
+def format_podman_launch_preview(rr: ResolvedRun) -> str:
+    """Human-readable orchestrator invocation and reconstructed container CLI."""
+    e = rr.podman_env
+    rt = str(e.get("CONTAINER_RUNTIME", rr.container_runtime))
+    lines: list[str] = []
+    lines.append("=== Orchestrator (actual subprocess) ===")
+    lines.append(f"cwd: {rr.run_podman_script.parent}")
+    lines.append(f"argv: bash {shlex.quote(str(rr.run_podman_script))}")
+    lines.append("environment (merged with host env for this process):")
+    for k in sorted(e.keys()):
+        lines.append(f"  {k}={e[k]}")
+    lines.append("")
+    lines.append("=== Equivalent container run (reconstructed; must match run_podman.sh) ===")
+    inner = _podman_run_argv_from_env(e, runtime=rt)
+    prefix = _numactl_launch_prefix_argv(e)
+    lines.append(shlex.join(prefix + inner))
+    if e.get("EXTRA_ENV_FILE"):
+        lines.append(
+            f"# plus -e KEY=value for each non-comment line in: {e['EXTRA_ENV_FILE']}"
+        )
+    if e.get("EXTRA_DOCKER_RUN_FILE"):
+        lines.append(
+            f"# plus extra argv from each line in: {e['EXTRA_DOCKER_RUN_FILE']}"
+        )
+    if rt == "docker" and e.get("REPLACE_CONTAINER") == "1":
+        lines.append("# docker: run_podman.sh runs: docker rm -f CONTAINER_NAME before run")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def log_podman_launch_preview(rr: ResolvedRun) -> None:
+    text = format_podman_launch_preview(rr)
+    print(text, flush=True)
+    preview_path = rr.run_dir / "podman_launch_preview.txt"
+    preview_path.write_text(text, encoding="utf-8")
 
 
 def start_log_follower(
@@ -975,6 +1065,7 @@ def iter_benchmark_artifact_paths(rr: ResolvedRun) -> list[Path]:
         gj,
         rr.run_dir / "run_manifest.json",
         rr.run_dir / "run_config.json",
+        rr.run_dir / "podman_launch_preview.txt",
         rr.run_dir / DASHBOARD_CSV_IN_RUN_DIR,
         rr.run_dir / GRAPH_OUTPUT_TOK,
         rr.run_dir / GRAPH_ITL,
@@ -1192,6 +1283,7 @@ def execute_benchmark_phase(
     logs_p: subprocess.Popen[bytes] | None = None
     try:
         print("Starting vLLM container...", flush=True)
+        log_podman_launch_preview(rr)
         run_podman_detached(run_podman_sh=rr.run_podman_script, env=rr.podman_env)
         time.sleep(1)
         logs_p = start_log_follower(
@@ -1387,6 +1479,9 @@ def run_suite_from_json_path(config_path: Path, args: argparse.Namespace) -> Non
         "guidellm_venv",
         "guidellm_env",
         "run_podman_script",
+        "hf_home",
+        "hf_home_container",
+        "hf_cache_volume",
     ):
         if key in data:
             suite_tooling[key] = data[key]
