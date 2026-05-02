@@ -16,7 +16,7 @@ Similarly, **`guidellm_env/bin/guidellm`** next to `cpu_vllm_bench.py` is prefer
 - **Host tools**: `numactl` (GuideLLM is launched under NUMA bind), `bash`, Python 3.
 - **GuideLLM**: install the CLI and ensure the binary exists (see defaults above).
 - **vLLM image**: e.g. `vllm/vllm-openai-cpu:v0.18.0` (override with `--vllm-image` or JSON `vllm_image`).
-- **Models**: `run_podman.sh` uses **`HF_HOME`** as the **`-v` bind** in `host_path:container_path` form, and **`HF_HOME_CONTAINER`** as the directory inside the container (see examples below). Set these from JSON (`hf_home`, `hf_home_container`) or CLI (`--hf-home`, `--hf-home-container`). If `hf_home` is a **host directory only** (no `:`), the orchestrator appends `:` + `hf_home_container` so Podman gets a valid mount (e.g. `/home/me/models` → `/home/me/models:/models` when `hf_home_container` is `/models`).
+- **Models**: `run_podman.sh` uses **`HF_HOME`** as the **`-v` bind** string passed through unchanged (typically `host_path:container_path`), and **`HF_HOME_CONTAINER`** as the in-container path for `-e HF_HOME=...`. Set them from JSON (`hf_home`, `hf_home_container`), from **`launch_env`** (`HF_HOME`, `HF_HOME_CONTAINER`), or from CLI. **`launch_env`** is merged into the `run_podman.sh` process environment; keys such as **`HF_TOKEN`** are forwarded into the container by `run_podman.sh` (see script header).
 
 Optional:
 
@@ -51,11 +51,12 @@ Pass one or more JSON files; each file is executed in order. Every file must con
 | `guidellm_venv` | Virtualenv root; binary used is `<venv>/bin/guidellm` if `guidellm_bin` is not set. |
 | `guidellm_env` | Object of extra environment variables for the GuideLLM subprocess only (e.g. `PATH`, `HTTP_PROXY`). |
 | `run_podman_script` | Path to `run_podman.sh`. |
-| `hf_home` | Volume bind passed to `run_podman.sh` as `HF_HOME`. Prefer `host:container` (e.g. `/data/hf:/models`). Host-only paths are normalized with `hf_home_container`. |
+| `hf_home` | Volume bind passed to `run_podman.sh` as `HF_HOME` (used as-is for `podman run -v`). |
 | `hf_home_container` | In-container cache path; passed as `HF_HOME_CONTAINER` (default often `/models`). |
 | `hf_cache_volume` | Deprecated alias for `hf_home` (same as in CLI). |
+| `launch_env` | Object merged into the **`run_podman.sh`** environment (later layers override). Use for `HF_HOME`, `HF_HOME_CONTAINER`, `HF_TOKEN`, etc. **`launch_env`** is deep-merged from `defaults.launch_env`, suite root `launch_env`, then each run’s `launch_env`. After merge, `HF_HOME` / `HF_HOME_CONTAINER` in **`launch_env`** override the top-level `hf_home` / `hf_home_container` keys for volume bind and inner `HF_HOME`. |
 
-Per-run objects in `runs` can override any of the above. Merge order: `defaults` → suite-level keys (`guidellm_*`, `run_podman_script`, `hf_home`, `hf_home_container`, `hf_cache_volume`) → each run entry.
+Per-run objects in `runs` can override any of the above. Merge order: `defaults` → suite-level keys (`guidellm_*`, `run_podman_script`, `hf_home`, `hf_home_container`, `hf_cache_volume`) → each run entry; **`launch_env`** is merged separately across defaults, suite root, and run (see table).
 
 Before each container start, the orchestrator **prints** (and saves under the run directory as **`podman_launch_preview.txt`**) the environment passed into `run_podman.sh` and a **reconstructed** `podman run` / `docker run` one-liner that should match `run_podman.sh` (file-based `EXTRA_ENV_FILE` / `EXTRA_DOCKER_RUN_FILE` expansions are called out in comments there).
 
@@ -132,7 +133,9 @@ bash run_podman.sh
 
 ### Match the orchestrator’s environment (illustrative)
 
-The Python code merges your JSON/CLI into variables such as `MODEL`, `VLLM_IMAGE`, `PORT`, `HF_HOME`, `HF_HOME_CONTAINER`, `VLLM_CPU_KVCACHE_SPACE`, `SERVER_NUMA_NODE`, `CONTAINER_NAME`, `VLLM_CPU_OMP_THREADS_BIND`, optional `SERVER_CPULIST`, `CPU_VISIBLE_MEMORY_NODES`, `OMP_NUM_THREADS`, `EXTRA_ENV_FILE`, `EXTRA_DOCKER_RUN_FILE`, `VLLM_USE_IMAGE_ENTRYPOINT`, then runs `bash run_podman.sh` with `DETACHED=1` and `REPLACE_CONTAINER=1`. Inspect **`podman_launch_preview.txt`** in a run directory for the exact values for that run.
+The Python code builds the `run_podman.sh` environment from JSON/CLI fields, then applies **`launch_env`** on top (verbatim string values). It always sets `DETACHED=1`, `REPLACE_CONTAINER=1`, and `CONTAINER_NAME` after that merge. Inspect **`podman_launch_preview.txt`** in a run directory for the exact values for that run.
+
+**`launch_env` vs `container_env`**: `launch_env` feeds the **host** script that runs Podman (volume bind `HF_HOME`, tokens forwarded by `run_podman.sh`, etc.). `container_env` is merged into the **extra `-e` file** for variables that should appear only inside the container (see `materialize_merged_extra_env` in the code map).
 
 ### Example JSON files (in-repo)
 
@@ -227,7 +230,7 @@ This comes from **Hugging Face Hub** when **`HF_HUB_OFFLINE=1`** (or equivalent)
 
 ### Wrong or missing model files in the container
 
-Ensure **`hf_home`** resolves to a real **`host:container`** bind. A host-only value is auto-fixed (see Models above). On the host, that path must contain the Hub cache layout the model id expects; inside the container, **`HF_HOME`** is set to **`hf_home_container`** (often `/models`).
+Ensure **`HF_HOME`** in JSON or `launch_env` is the exact string you want for **`podman run -v`** (usually `host:container`). On the host, the mounted path must contain the Hub cache layout the model id expects; inside the container, **`HF_HOME`** is set from **`HF_HOME_CONTAINER`** (often `/models`).
 
 ## Useful CLI flags
 

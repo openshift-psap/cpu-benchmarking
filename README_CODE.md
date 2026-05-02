@@ -12,9 +12,9 @@ This document describes how the orchestrator is structured so you can change beh
 ## Configuration resolution
 
 - **`resolve_run(cfg, args)`** — Single source of truth for a run. Reads benchmark fields from `cfg` with fallbacks to `args`. Important paths and env:
-  - **`hf_home`** — Host bind for `podman run -v` (same string `run_podman.sh` expects as `HF_HOME`: `host_path:container_path`). From JSON: `hf_home`, deprecated `hf_cache_volume`, or `--hf-home`. **`normalize_hf_home_volume_bind()`** appends `:` + `hf_home_container` when the value has no `:` (avoids invalid `-v /hostonly`).
-  - **`hf_home_container`** — Value passed into the container as `-e HF_HOME=...` (JSON `hf_home_container` or CLI `--hf-home-container`).
-  - Suite JSON merge (in **`run_suite_from_json_path()`**): `defaults` → suite-level keys (`guidellm_*`, `run_podman_script`, **`hf_home`**, **`hf_home_container`**, **`hf_cache_volume`**) → each object in **`runs`**.
+  - **`hf_home`** / **`hf_home_container`** — Passed through to `run_podman.sh` as `HF_HOME` (the **`-v`** bind string) and `HF_HOME_CONTAINER` (inner `HF_HOME`). Values are **not** rewritten; optional **`launch_env`** entries `HF_HOME` / `HF_HOME_CONTAINER` override the top-level JSON keys after merge.
+  - **`launch_env`** — Merged from `defaults.launch_env`, suite-root `launch_env`, and per-run `launch_env` via **`merge_launch_env_from_json_layers()`**, then applied in **`resolve_run()`** with **`podman_env.update(launch_env_user)`** (after which `DETACHED`, `REPLACE_CONTAINER`, and `CONTAINER_NAME` are forced for orchestration).
+  - Suite JSON shallow merge: `defaults` → suite-level keys (`guidellm_*`, `run_podman_script`, **`hf_home`**, …) → each **`runs`** entry; **`launch_env`** uses the separate deep merge above.
 - **`ResolvedRun`** — Immutable-ish snapshot used for the rest of the pipeline (`run_dir`, `podman_env`, `guidellm_bin`, etc.).
 
 ## Benchmark phase (container + GuideLLM)

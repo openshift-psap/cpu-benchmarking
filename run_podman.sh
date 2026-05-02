@@ -9,9 +9,12 @@
 #   VLLM_EXTRA_ARGS       extra CLI args after MODEL (default: --dtype=bfloat16)
 #   PORT                  host/container port (default: 8000)
 #   SHM_SIZE              --shm-size (default: 4g)
-#   HF_HOME               -v bind host:container for model/cache (default: /home/naveen/models:/models)
+#   HF_HOME               -v bind passed through to ``podman run -v`` as-is (default: /home/naveen/models:/models)
 #                         Deprecated alias: HF_CACHE_VOLUME (used if HF_HOME is unset)
 #   HF_HOME_CONTAINER     value for -e HF_HOME inside container (default: /models)
+#
+#   HF_TOKEN, HF_HUB_TOKEN, HUGGING_FACE_HUB_TOKEN  optional; forwarded as ``-e`` when set (e.g. from JSON ``launch_env``)
+#   HF_HUB_OFFLINE, HF_ENDPOINT                    same
 #
 #   VLLM_CPU_KVCACHE_SPACE   KV cache space for CPU backend in GiB, integer only (default: 128)
 #
@@ -101,6 +104,13 @@ fi
 if [[ -n "${OMP_NUM_THREADS+x}" && -n "${OMP_NUM_THREADS:-}" ]]; then
   RUN_ARGS+=(-e "OMP_NUM_THREADS=${OMP_NUM_THREADS}")
 fi
+
+# Hub / auth (from JSON ``launch_env`` or host env); each becomes ``-e`` when set.
+if [[ -n "${HF_TOKEN+x}" ]]; then RUN_ARGS+=(-e "HF_TOKEN=${HF_TOKEN}"); fi
+if [[ -n "${HF_HUB_TOKEN+x}" ]]; then RUN_ARGS+=(-e "HF_HUB_TOKEN=${HF_HUB_TOKEN}"); fi
+if [[ -n "${HUGGING_FACE_HUB_TOKEN+x}" ]]; then RUN_ARGS+=(-e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}"); fi
+if [[ -n "${HF_HUB_OFFLINE+x}" ]]; then RUN_ARGS+=(-e "HF_HUB_OFFLINE=${HF_HUB_OFFLINE}"); fi
+if [[ -n "${HF_ENDPOINT+x}" ]]; then RUN_ARGS+=(-e "HF_ENDPOINT=${HF_ENDPOINT}"); fi
 
 if [[ -n "${EXTRA_ENV_FILE}" && -f "${EXTRA_ENV_FILE}" ]]; then
   while IFS= read -r line || [[ -n "${line}" ]]; do

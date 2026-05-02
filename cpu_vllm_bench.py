@@ -274,19 +274,30 @@ def parse_extra_env_file(path: Path | None) -> dict[str, str]:
     return out
 
 
-def normalize_hf_home_volume_bind(bind: str, container_mount: str) -> str:
-    """``run_podman.sh`` passes ``HF_HOME`` to ``podman run -v`` as ``host:container``.
+def _redact_launch_env_for_manifest(env: dict[str, str]) -> dict[str, str]:
+    """Avoid writing raw tokens into ``run_manifest.json``."""
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        ku = k.upper()
+        if "TOKEN" in ku or "SECRET" in ku or "PASSWORD" in ku:
+            out[k] = "***"
+        else:
+            out[k] = v
+    return out
 
-    If *bind* has no ``:``, append ``:`` + *container_mount* so the mount is valid.
-    If *bind* already contains ``:``, return it unchanged (named volume or explicit pair).
-    """
-    b = bind.strip()
-    c = (container_mount or "").strip()
-    if not b or ":" in b:
-        return b
-    if not c:
-        return b
-    return f"{b}:{c}"
+
+def merge_launch_env_from_json_layers(
+    defaults: dict[str, Any],
+    suite_root: dict[str, Any],
+    run_layer: dict[str, Any],
+) -> dict[str, str]:
+    """Merge ``launch_env`` objects from defaults, suite root, and run (later wins)."""
+    out: dict[str, str] = {}
+    for d in (defaults, suite_root, run_layer):
+        raw = d.get("launch_env")
+        if isinstance(raw, dict):
+            out.update({str(k): str(v) for k, v in raw.items()})
+    return out
 
 
 def effective_container_env(
@@ -444,6 +455,15 @@ def _podman_run_argv_from_env(e: dict[str, str], *, runtime: str) -> list[str]:
         parts += ["-e", f"CPU_VISIBLE_MEMORY_NODES={e['CPU_VISIBLE_MEMORY_NODES']}"]
     if e.get("OMP_NUM_THREADS"):
         parts += ["-e", f"OMP_NUM_THREADS={e['OMP_NUM_THREADS']}"]
+    for k in (
+        "HF_TOKEN",
+        "HF_HUB_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HF_HUB_OFFLINE",
+        "HF_ENDPOINT",
+    ):
+        if k in e:
+            parts += ["-e", f"{k}={e[k]}"]
     parts += ["-v", e["HF_HOME"]]
     if str(e.get("VLLM_USE_IMAGE_ENTRYPOINT", "0")) == "1":
         parts += [e["VLLM_IMAGE"], e["MODEL"]]
@@ -864,6 +884,7 @@ class ResolvedRun:
     run_podman_script: Path
     guidellm_bin: Path
     guidellm_subprocess_env: dict[str, str]
+    launch_env_user: dict[str, str]
     experiment: str
     run_name_ml: str
     user_mlflow_tags: dict[str, str] = field(default_factory=dict)
@@ -1106,19 +1127,20 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
     port = int(cfg.get("port", args.port))
     max_seconds = int(cfg.get("max_seconds", args.max_seconds))
     shm_size = str(cfg.get("shm_size", args.shm_size))
-    hf_home_raw = str(
-        cfg.get("hf_home")
+    raw_launch = cfg.get("launch_env")
+    launch_env_user: dict[str, str] = {}
+    if isinstance(raw_launch, dict):
+        launch_env_user = {str(k): str(v) for k, v in raw_launch.items()}
+    hf_home = str(
+        launch_env_user.get("HF_HOME")
+        or cfg.get("hf_home")
         or cfg.get("hf_cache_volume")
         or args.hf_home
     ).strip()
-    hf_home_container = str(cfg.get("hf_home_container", args.hf_home_container)).strip()
-    hf_home = normalize_hf_home_volume_bind(hf_home_raw, hf_home_container)
-    if hf_home != hf_home_raw:
-        print(
-            f"Note: hf_home normalized for Podman -v (was {hf_home_raw!r}, using {hf_home!r}). "
-            "Prefer explicit host:container in JSON or --hf-home.",
-            flush=True,
-        )
+    hf_home_container = str(
+        launch_env_user.get("HF_HOME_CONTAINER")
+        or cfg.get("hf_home_container", args.hf_home_container)
+    ).strip()
     vllm_omp = str(cfg.get("vllm_omp_threads_bind", args.vllm_omp_threads_bind))
     processor = str(cfg.get("processor", model))
     vllm_image = str(cfg.get("vllm_image", args.vllm_image))
@@ -1200,6 +1222,12 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
     if cfg.get("vllm_use_image_entrypoint"):
         podman_env["VLLM_USE_IMAGE_ENTRYPOINT"] = "1"
 
+    podman_env.update(launch_env_user)
+    podman_env["DETACHED"] = "1"
+    podman_env["REPLACE_CONTAINER"] = "1"
+    podman_env["CONTAINER_NAME"] = container_name
+    podman_env["CONTAINER_RUNTIME"] = args.container_runtime
+
     utags: dict[str, str] = {}
     cfg_tags = cfg.get("mlflow_tags")
     if isinstance(cfg_tags, dict):
@@ -1228,8 +1256,8 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
         port=port,
         max_seconds=max_seconds,
         shm_size=shm_size,
-        hf_home=hf_home,
-        hf_home_container=hf_home_container,
+        hf_home=podman_env["HF_HOME"],
+        hf_home_container=podman_env["HF_HOME_CONTAINER"],
         vllm_omp_threads_bind=vllm_omp,
         run_id=run_id,
         run_dir=run_dir,
@@ -1241,6 +1269,7 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
         run_podman_script=run_podman_script,
         guidellm_bin=guidellm_bin,
         guidellm_subprocess_env=guidellm_subprocess_env,
+        launch_env_user=dict(launch_env_user),
         experiment=str(cfg.get("experiment", args.experiment)),
         run_name_ml=str(cfg.get("run_name", run_id))[:250],
         user_mlflow_tags=utags,
@@ -1284,6 +1313,7 @@ def execute_benchmark_phase(
         "run_podman_script": str(rr.run_podman_script),
         "guidellm_bin": str(rr.guidellm_bin),
         "guidellm_subprocess_env": rr.guidellm_subprocess_env,
+        "launch_env": _redact_launch_env_for_manifest(rr.launch_env_user),
     }
     manifest_path = rr.run_dir / "run_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1507,10 +1537,14 @@ def run_suite_from_json_path(config_path: Path, args: argparse.Namespace) -> Non
     ):
         if key in data:
             suite_tooling[key] = data[key]
+    defaults_dict = data.get("defaults", {}) or {}
     for i, run_cfg in enumerate(runs):
         if not isinstance(run_cfg, dict):
             continue
-        merged = {**data.get("defaults", {}), **suite_tooling, **run_cfg}
+        merged = {**defaults_dict, **suite_tooling, **run_cfg}
+        lev = merge_launch_env_from_json_layers(defaults_dict, data, run_cfg)
+        if lev:
+            merged["launch_env"] = lev
         merged.setdefault("experiment", global_exp)
         mtags = {**default_tags}
         rt = merged.get("mlflow_tags")
@@ -1566,10 +1600,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--hf-home",
         default="/home/naveen/models:/models",
-        help=(
-            "Podman -v bind passed as HF_HOME to run_podman.sh: use host:container "
-            "(e.g. /data/hf:/models). A host-only path gets :--hf-home-container appended automatically."
-        ),
+        help="Value for HF_HOME passed to run_podman.sh (Podman -v bind; used as-is).",
     )
     p.add_argument(
         "--hf-cache-volume",
