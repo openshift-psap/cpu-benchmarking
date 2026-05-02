@@ -7,7 +7,7 @@ Execution order per run:
   2. Dashboard CSV: always write ``dashboard_benchmark.csv`` when GuideLLM JSON exists, then optional concurrency graphs (PNG); optionally append to ``--dashboard-csv``. If ``mlflow_tags`` includes ``project``, it is appended to ``--dashboard-version`` for the performance-dashboard import script.
   3. Optional: single MLflow upload (tags, params, metrics, artifacts) — last step only.
 
-See vllm_guidellm_benchmark/README.md for setup and examples.
+See README.md in this repository for setup and examples.
 
 Multiple suite files: pass ``--config`` more than once; each file is run to completion in order.
 """
@@ -31,8 +31,30 @@ from pathlib import Path
 from typing import Any, TextIO
 
 HOME = Path.home()
+_SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RUN_PODMAN = HOME / "run_podman.sh"
 DEFAULT_GUIDELLM_BIN = HOME / "guidellm_env" / "bin" / "guidellm"
+
+
+def discover_run_podman_script() -> Path:
+    """Prefer ``run_podman.sh`` next to this script, then CWD, then ``~/run_podman.sh``."""
+    candidates = (
+        _SCRIPT_DIR / "run_podman.sh",
+        Path.cwd() / "run_podman.sh",
+        DEFAULT_RUN_PODMAN,
+    )
+    for p in candidates:
+        if p.is_file():
+            return p
+    return _SCRIPT_DIR / "run_podman.sh"
+
+
+def discover_guidellm_bin() -> Path:
+    """Prefer ``guidellm_env/bin/guidellm`` next to this script, then the home default."""
+    local = _SCRIPT_DIR / "guidellm_env" / "bin" / "guidellm"
+    if local.is_file():
+        return local
+    return DEFAULT_GUIDELLM_BIN
 DEFAULT_IMPORT_SCRIPT = (
     HOME
     / "performance-dashboard"
@@ -437,6 +459,7 @@ def run_guidellm(
     max_seconds: int,
     output_dir: Path,
     output_name: str,
+    extra_env: dict[str, str] | None = None,
 ) -> None:
     data = json.dumps({"prompt_tokens": isl, "output_tokens": osl})
     cmd = [
@@ -470,6 +493,7 @@ def run_guidellm(
     out_log = output_dir / "guidellm.stdout.log"
     err_log = output_dir / "guidellm.stderr.log"
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_env = {**os.environ, **(extra_env or {})}
     with open(out_log, "w", encoding="utf-8", errors="replace") as out_f, open(
         err_log, "w", encoding="utf-8", errors="replace"
     ) as err_f:
@@ -479,6 +503,7 @@ def run_guidellm(
             stdout=out_f,
             stderr=err_f,
             text=True,
+            env=run_env,
         )
     print(f"GuideLLM logs: {out_log} , {err_log}", flush=True)
 
@@ -731,12 +756,36 @@ class ResolvedRun:
     container_runtime: str
     container_env: dict[str, str]
     podman_env: dict[str, str]
+    run_podman_script: Path
+    guidellm_bin: Path
+    guidellm_subprocess_env: dict[str, str]
     experiment: str
     run_name_ml: str
     user_mlflow_tags: dict[str, str] = field(default_factory=dict)
     extra_env_file_path: Path | None = None
     container_env_inline: dict[str, str] = field(default_factory=dict)
     dashboard_version: str = DEFAULT_DASHBOARD_IMPORT_VERSION
+
+
+def _parse_guidellm_env(cfg: dict[str, Any]) -> dict[str, str]:
+    raw = cfg.get("guidellm_env")
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    return {}
+
+
+def _resolve_guidellm_bin(cfg: dict[str, Any], args: argparse.Namespace) -> Path:
+    if cfg.get("guidellm_bin"):
+        return Path(str(cfg["guidellm_bin"])).expanduser()
+    if cfg.get("guidellm_venv"):
+        return Path(str(cfg["guidellm_venv"])).expanduser() / "bin" / "guidellm"
+    return Path(args.guidellm_bin).expanduser()
+
+
+def _resolve_run_podman_script(cfg: dict[str, Any], args: argparse.Namespace) -> Path:
+    if cfg.get("run_podman_script"):
+        return Path(str(cfg["run_podman_script"])).expanduser()
+    return Path(args.run_podman_script).expanduser()
 
 
 def _truncate_for_plot(s: str, max_len: int) -> str:
@@ -1047,6 +1096,10 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
 
     dashboard_version = str(cfg.get("dashboard_version", args.dashboard_version))
 
+    run_podman_script = _resolve_run_podman_script(cfg, args)
+    guidellm_bin = _resolve_guidellm_bin(cfg, args)
+    guidellm_subprocess_env = _parse_guidellm_env(cfg)
+
     return ResolvedRun(
         model=model,
         processor=processor,
@@ -1072,6 +1125,9 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
         container_runtime=args.container_runtime,
         container_env=container_env,
         podman_env=podman_env,
+        run_podman_script=run_podman_script,
+        guidellm_bin=guidellm_bin,
+        guidellm_subprocess_env=guidellm_subprocess_env,
         experiment=str(cfg.get("experiment", args.experiment)),
         run_name_ml=str(cfg.get("run_name", run_id))[:250],
         user_mlflow_tags=utags,
@@ -1112,6 +1168,9 @@ def execute_benchmark_phase(
         "container_env": rr.container_env,
         "podman_launch_env": {k: v for k, v in rr.podman_env.items() if k != "DETACHED"},
         "dashboard_version": rr.dashboard_version,
+        "run_podman_script": str(rr.run_podman_script),
+        "guidellm_bin": str(rr.guidellm_bin),
+        "guidellm_subprocess_env": rr.guidellm_subprocess_env,
     }
     manifest_path = rr.run_dir / "run_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1133,7 +1192,7 @@ def execute_benchmark_phase(
     logs_p: subprocess.Popen[bytes] | None = None
     try:
         print("Starting vLLM container...", flush=True)
-        run_podman_detached(run_podman_sh=args.run_podman_script, env=rr.podman_env)
+        run_podman_detached(run_podman_sh=rr.run_podman_script, env=rr.podman_env)
         time.sleep(1)
         logs_p = start_log_follower(
             runtime=rr.container_runtime,
@@ -1144,7 +1203,7 @@ def execute_benchmark_phase(
         target = f"http://127.0.0.1:{rr.port}"
         wait_for_server(target, timeout_sec=args.ready_timeout)
         run_guidellm(
-            guidellm_bin=args.guidellm_bin,
+            guidellm_bin=rr.guidellm_bin,
             client_numa=rr.client_numa,
             target=target,
             model=rr.model,
@@ -1155,6 +1214,7 @@ def execute_benchmark_phase(
             max_seconds=rr.max_seconds,
             output_dir=rr.run_dir,
             output_name=rr.out_json,
+            extra_env=rr.guidellm_subprocess_env or None,
         )
     finally:
         stop_event.set()
@@ -1295,6 +1355,12 @@ def finalize_after_benchmark(rr: ResolvedRun, args: argparse.Namespace) -> None:
 
 def single_benchmark(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     rr = resolve_run(cfg, args)
+    if not rr.run_podman_script.is_file():
+        print(f"Missing run_podman script {rr.run_podman_script}", file=sys.stderr)
+        raise SystemExit(1)
+    if not rr.guidellm_bin.is_file():
+        print(f"Missing GuideLLM binary {rr.guidellm_bin}", file=sys.stderr)
+        raise SystemExit(1)
     rr.run_dir.mkdir(parents=True, exist_ok=True)
     with tee_stdout_stderr_to_run_dir(rr.run_dir):
         execute_benchmark_phase(rr, args, run_config=cfg)
@@ -1315,10 +1381,19 @@ def run_suite_from_json_path(config_path: Path, args: argparse.Namespace) -> Non
     default_tags = data.get("mlflow_tags")
     if not isinstance(default_tags, dict):
         default_tags = {}
+    suite_tooling: dict[str, Any] = {}
+    for key in (
+        "guidellm_bin",
+        "guidellm_venv",
+        "guidellm_env",
+        "run_podman_script",
+    ):
+        if key in data:
+            suite_tooling[key] = data[key]
     for i, run_cfg in enumerate(runs):
         if not isinstance(run_cfg, dict):
             continue
-        merged = {**data.get("defaults", {}), **run_cfg}
+        merged = {**data.get("defaults", {}), **suite_tooling, **run_cfg}
         merged.setdefault("experiment", global_exp)
         mtags = {**default_tags}
         rt = merged.get("mlflow_tags")
@@ -1345,8 +1420,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--output-base", type=Path, default=HOME / "results" / "vllm_guidellm_runs")
 
-    p.add_argument("--run-podman-script", type=Path, default=DEFAULT_RUN_PODMAN)
-    p.add_argument("--guidellm-bin", type=Path, default=DEFAULT_GUIDELLM_BIN)
+    p.add_argument(
+        "--run-podman-script",
+        type=Path,
+        default=discover_run_podman_script(),
+        help="Path to run_podman.sh (default: next to this script, then CWD, then ~/run_podman.sh)",
+    )
+    p.add_argument(
+        "--guidellm-bin",
+        type=Path,
+        default=discover_guidellm_bin(),
+        help="GuideLLM CLI binary (default: ./guidellm_env/bin/guidellm next to script, else ~/guidellm_env/bin/guidellm)",
+    )
     p.add_argument("--container-runtime", default=os.environ.get("CONTAINER_RUNTIME", "podman"))
 
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
@@ -1427,12 +1512,6 @@ def main() -> None:
     args = parse_args()
     if getattr(args, "hf_cache_volume", None):
         args.hf_home = args.hf_cache_volume
-    if not args.run_podman_script.is_file():
-        print(f"Missing {args.run_podman_script}", file=sys.stderr)
-        sys.exit(1)
-    if not args.guidellm_bin.is_file():
-        print(f"Missing GuideLLM binary {args.guidellm_bin}", file=sys.stderr)
-        sys.exit(1)
 
     if args.config_files:
         for fi, cfg_path in enumerate(args.config_files):

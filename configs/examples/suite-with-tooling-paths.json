@@ -1,0 +1,33 @@
+{
+  "experiment": "example-tooling",
+  "mlflow_tags": { "project": "examples" },
+  "run_podman_script": "/path/to/your/cpu-benchmarking/run_podman.sh",
+  "guidellm_venv": "/path/to/your/guidellm_env",
+  "guidellm_env": {
+    "PATH": "/path/to/your/guidellm_env/bin:/usr/bin:/bin"
+  },
+  "defaults": {
+    "server_numa": 1,
+    "client_numa": 0,
+    "max_seconds": 120,
+    "isl": 128,
+    "osl": 128,
+    "rate": "1,2,4",
+    "kv_cache_gb": 64,
+    "vllm_image": "vllm/vllm-openai-cpu:v0.18.0",
+    "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096",
+    "hf_home": "/path/on/host/models:/models",
+    "output_dir": "./results"
+  },
+  "runs": [
+    {
+      "run_name": "run-a-default-tooling",
+      "model": "Qwen/Qwen3-1.7B"
+    },
+    {
+      "run_name": "run-b-override-guidellm-bin",
+      "model": "Qwen/Qwen3-1.7B",
+      "guidellm_bin": "/opt/other_venv/bin/guidellm"
+    }
+  ]
+}

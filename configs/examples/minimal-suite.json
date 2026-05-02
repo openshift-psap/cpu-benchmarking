@@ -1,0 +1,22 @@
+{
+  "experiment": "example-minimal",
+  "defaults": {
+    "server_numa": 0,
+    "client_numa": 0,
+    "max_seconds": 60,
+    "isl": 128,
+    "osl": 128,
+    "rate": "1,2",
+    "kv_cache_gb": 32,
+    "vllm_image": "vllm/vllm-openai-cpu:v0.18.0",
+    "vllm_extra_args": "--dtype=bfloat16",
+    "hf_home": "/path/on/host/models:/models",
+    "output_dir": "./results"
+  },
+  "runs": [
+    {
+      "run_name": "example-qwen-smoke",
+      "model": "Qwen/Qwen3-1.7B"
+    }
+  ]
+}
