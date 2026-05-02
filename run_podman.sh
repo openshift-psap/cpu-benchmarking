@@ -1,0 +1,1 @@
+podman run --rm --security-opt seccomp=unconfined --security-opt=label=disable --cap-add SYS_NICE --shm-size=4g -p 8000:8000 --name vllm-server-767222 -e VLLM_CPU_KVCACHE_SPACE=128 -e VLLM_CPU_OMP_THREADS_BIND=auto -e HF_HOME=/models -v /home/naveen/models:/models vllm/vllm-openai-cpu:v0.18.0 Qwen/Qwen3-1.7B --dtype=bfloat16
