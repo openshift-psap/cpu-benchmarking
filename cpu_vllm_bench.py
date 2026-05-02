@@ -274,6 +274,21 @@ def parse_extra_env_file(path: Path | None) -> dict[str, str]:
     return out
 
 
+def normalize_hf_home_volume_bind(bind: str, container_mount: str) -> str:
+    """``run_podman.sh`` passes ``HF_HOME`` to ``podman run -v`` as ``host:container``.
+
+    If *bind* has no ``:``, append ``:`` + *container_mount* so the mount is valid.
+    If *bind* already contains ``:``, return it unchanged (named volume or explicit pair).
+    """
+    b = bind.strip()
+    c = (container_mount or "").strip()
+    if not b or ":" in b:
+        return b
+    if not c:
+        return b
+    return f"{b}:{c}"
+
+
 def effective_container_env(
     *,
     kv_cache_gb: int,
@@ -1091,12 +1106,19 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
     port = int(cfg.get("port", args.port))
     max_seconds = int(cfg.get("max_seconds", args.max_seconds))
     shm_size = str(cfg.get("shm_size", args.shm_size))
-    hf_home = str(
+    hf_home_raw = str(
         cfg.get("hf_home")
         or cfg.get("hf_cache_volume")
         or args.hf_home
-    )
-    hf_home_container = str(cfg.get("hf_home_container", args.hf_home_container))
+    ).strip()
+    hf_home_container = str(cfg.get("hf_home_container", args.hf_home_container)).strip()
+    hf_home = normalize_hf_home_volume_bind(hf_home_raw, hf_home_container)
+    if hf_home != hf_home_raw:
+        print(
+            f"Note: hf_home normalized for Podman -v (was {hf_home_raw!r}, using {hf_home!r}). "
+            "Prefer explicit host:container in JSON or --hf-home.",
+            flush=True,
+        )
     vllm_omp = str(cfg.get("vllm_omp_threads_bind", args.vllm_omp_threads_bind))
     processor = str(cfg.get("processor", model))
     vllm_image = str(cfg.get("vllm_image", args.vllm_image))
@@ -1544,7 +1566,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--hf-home",
         default="/home/naveen/models:/models",
-        help="Podman -v bind (host:container); passed as HF_HOME to run_podman.sh",
+        help=(
+            "Podman -v bind passed as HF_HOME to run_podman.sh: use host:container "
+            "(e.g. /data/hf:/models). A host-only path gets :--hf-home-container appended automatically."
+        ),
     )
     p.add_argument(
         "--hf-cache-volume",

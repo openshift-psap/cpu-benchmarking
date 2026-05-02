@@ -16,7 +16,7 @@ Similarly, **`guidellm_env/bin/guidellm`** next to `cpu_vllm_bench.py` is prefer
 - **Host tools**: `numactl` (GuideLLM is launched under NUMA bind), `bash`, Python 3.
 - **GuideLLM**: install the CLI and ensure the binary exists (see defaults above).
 - **vLLM image**: e.g. `vllm/vllm-openai-cpu:v0.18.0` (override with `--vllm-image` or JSON `vllm_image`).
-- **Models**: `run_podman.sh` uses **`HF_HOME`** as the **`-v` bind** in `host_path:container_path` form, and **`HF_HOME_CONTAINER`** as the directory inside the container (see examples below). Set these from JSON (`hf_home`, `hf_home_container`) or CLI (`--hf-home`, `--hf-home-container`).
+- **Models**: `run_podman.sh` uses **`HF_HOME`** as the **`-v` bind** in `host_path:container_path` form, and **`HF_HOME_CONTAINER`** as the directory inside the container (see examples below). Set these from JSON (`hf_home`, `hf_home_container`) or CLI (`--hf-home`, `--hf-home-container`). If `hf_home` is a **host directory only** (no `:`), the orchestrator appends `:` + `hf_home_container` so Podman gets a valid mount (e.g. `/home/me/models` → `/home/me/models:/models` when `hf_home_container` is `/models`).
 
 Optional:
 
@@ -51,7 +51,7 @@ Pass one or more JSON files; each file is executed in order. Every file must con
 | `guidellm_venv` | Virtualenv root; binary used is `<venv>/bin/guidellm` if `guidellm_bin` is not set. |
 | `guidellm_env` | Object of extra environment variables for the GuideLLM subprocess only (e.g. `PATH`, `HTTP_PROXY`). |
 | `run_podman_script` | Path to `run_podman.sh`. |
-| `hf_home` | Volume bind passed to `run_podman.sh` as `HF_HOME` (string `host:container`, e.g. `/data/hf:/models`). |
+| `hf_home` | Volume bind passed to `run_podman.sh` as `HF_HOME`. Prefer `host:container` (e.g. `/data/hf:/models`). Host-only paths are normalized with `hf_home_container`. |
 | `hf_home_container` | In-container cache path; passed as `HF_HOME_CONTAINER` (default often `/models`). |
 | `hf_cache_volume` | Deprecated alias for `hf_home` (same as in CLI). |
 
@@ -215,6 +215,19 @@ python3 cpu_vllm_bench.py \
   --output-base ./results \
   --mlflow
 ```
+
+## Troubleshooting
+
+### `LocalEntryNotFoundError` / “outgoing traffic has been disabled”
+
+This comes from **Hugging Face Hub** when **`HF_HUB_OFFLINE=1`** (or equivalent) is set **and** the model revision is not fully present under your cache mount. The smoke config [`configs/smoke/test1.json`](configs/smoke/test1.json) sets `HF_HUB_OFFLINE` in `container_env`.
+
+- **Offline / air-gapped**: pre-download the model snapshot into the host directory you mount (same tree Hub would use under `HF_HOME` / `HF_HOME` inside the container), or remove `HF_HUB_OFFLINE` only after the cache is complete.
+- **Online**: remove `HF_HUB_OFFLINE` from `container_env` (or set `HF_HUB_OFFLINE=0`) so vLLM can download.
+
+### Wrong or missing model files in the container
+
+Ensure **`hf_home`** resolves to a real **`host:container`** bind. A host-only value is auto-fixed (see Models above). On the host, that path must contain the Hub cache layout the model id expects; inside the container, **`HF_HOME`** is set to **`hf_home_container`** (often `/models`).
 
 ## Useful CLI flags
 
