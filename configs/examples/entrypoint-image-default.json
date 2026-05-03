@@ -1,0 +1,28 @@
+{
+  "experiment": "entrypoint-use-image-cmd",
+  "description": "vllm_use_image_entrypoint=true => podman run ... IMAGE MODEL only. Image ENTRYPOINT/CMD must start the OpenAI server on port 8000.",
+  "defaults": {
+    "server_numa": 0,
+    "client_numa": 0,
+    "max_seconds": 60,
+    "isl": 64,
+    "osl": 32,
+    "rate": "1",
+    "kv_cache_gb": 32,
+    "vllm_image": "docker.io/vllm/vllm-openai-cpu:v0.18.0",
+    "vllm_extra_args": "",
+    "hf_home": "/path/on/host/models:/models",
+    "hf_home_container": "/models",
+    "output_dir": "./results",
+    "vllm_use_image_entrypoint": true,
+    "environment": {
+      "HF_HUB_OFFLINE": "1"
+    }
+  },
+  "runs": [
+    {
+      "run_name": "image-entrypoint-smoke",
+      "model": "Qwen/Qwen3-0.6B"
+    }
+  ]
+}

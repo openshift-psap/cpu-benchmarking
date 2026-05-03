@@ -1,0 +1,29 @@
+{
+  "experiment": "test-something",
+  "defaults": {
+    "output_dir": "./results/smoke",
+    "server_numa": 0,
+    "client_numa": 0,
+    "max_seconds": 5,
+    "kv_cache_gb": 64,
+    "isl": 32,
+    "osl": 32,
+    "rate": "1",
+    "vllm_image": "docker.io/vllm/vllm-openai-cpu:v0.18.0",
+    "vllm_extra_args": "--dtype=bfloat16 --max-model-len 512",
+    "hf_home": "/home/nmiriyal/models:/models",
+    "hf_home_container": "/models",
+    "environment": {
+      "VLLM_CPU_OMP_THREADS_BIND": "auto",
+      "HF_HUB_OFFLINE": "1",
+      "VLLM_CPU_NUM_OF_RESERVED_CPU": "1",
+      "CPU_VISIBLE_MEMORY_NODES": "1"
+    }
+  },
+  "runs": [
+    {
+      "run_name": "smoke-qwen-tiny",
+      "model": "Qwen/Qwen3-4B"
+    }
+  ]
+}

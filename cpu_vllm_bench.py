@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-vLLM (Podman) + GuideLLM benchmark orchestrator.
+vLLM (Podman/Docker) + GuideLLM benchmark orchestrator.
 
 Execution order per run:
-  1. Start container (after printing a podman launch preview), sample metrics, run GuideLLM, stop container (writes ``run_config.json`` from the suite/CLI config).
-  2. Dashboard CSV: always write ``dashboard_benchmark.csv`` when GuideLLM JSON exists, then optional concurrency graphs (PNG); optionally append to ``--dashboard-csv``. If ``mlflow_tags`` includes ``project``, it is appended to ``--dashboard-version`` for the performance-dashboard import script.
+  1. Build the container ``run`` argv in Python (no ``run_podman.sh``), print a launch preview,
+     start the detached container, sample metrics, run GuideLLM, stop the container
+     (writes ``run_config.json`` from the suite/CLI config).
+  2. Dashboard CSV: always write ``dashboard_benchmark.csv`` when GuideLLM JSON exists,
+     then optional concurrency graphs (PNG); optionally append to ``--dashboard-csv``.
   3. Optional: single MLflow upload (tags, params, metrics, artifacts) — last step only.
 
-See README.md for setup and examples; README_CODE.md for code paths.
+Suite JSON: put container ``-e`` variables under ``environment`` (merged from defaults,
+suite root, and each run). Legacy keys ``container_env`` and ``launch_env`` are still
+merged into the same container env, except ``HF_HOME`` / ``HF_HOME_CONTAINER`` in
+``launch_env`` — those only set the volume bind / inner path for the orchestrator,
+not as arbitrary ``-e`` values.
 
 Multiple suite files: pass ``--config`` more than once; each file is run to completion in order.
 """
@@ -20,6 +27,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -33,21 +41,7 @@ from typing import Any, TextIO
 
 HOME = Path.home()
 _SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_RUN_PODMAN = HOME / "run_podman.sh"
 DEFAULT_GUIDELLM_BIN = HOME / "guidellm_env" / "bin" / "guidellm"
-
-
-def discover_run_podman_script() -> Path:
-    """Prefer ``run_podman.sh`` next to this script, then CWD, then ``~/run_podman.sh``."""
-    candidates = (
-        _SCRIPT_DIR / "run_podman.sh",
-        Path.cwd() / "run_podman.sh",
-        DEFAULT_RUN_PODMAN,
-    )
-    for p in candidates:
-        if p.is_file():
-            return p
-    return _SCRIPT_DIR / "run_podman.sh"
 
 
 def discover_guidellm_bin() -> Path:
@@ -291,13 +285,55 @@ def merge_launch_env_from_json_layers(
     suite_root: dict[str, Any],
     run_layer: dict[str, Any],
 ) -> dict[str, str]:
-    """Merge ``launch_env`` objects from defaults, suite root, and run (later wins)."""
+    """Merge ``launch_env`` objects from defaults, suite root, and run (later wins).
+
+    Used for ``HF_HOME`` / ``HF_HOME_CONTAINER`` overrides (volume bind and inner cache path).
+    Other ``launch_env`` keys are also folded into the container ``environment`` merge
+    (see ``_layer_environment_for_container``) except those two bind-related keys.
+    """
     out: dict[str, str] = {}
     for d in (defaults, suite_root, run_layer):
         raw = d.get("launch_env")
         if isinstance(raw, dict):
             out.update({str(k): str(v) for k, v in raw.items()})
     return out
+
+
+def _layer_environment_for_container(d: dict[str, Any]) -> dict[str, str]:
+    """One JSON object: ``environment``, ``container_env``, and non-bind ``launch_env`` keys."""
+    out: dict[str, str] = {}
+    for key in ("environment", "container_env"):
+        raw = d.get(key)
+        if isinstance(raw, dict):
+            out.update({str(k): str(v) for k, v in raw.items()})
+    le = d.get("launch_env")
+    if isinstance(le, dict):
+        for k, v in le.items():
+            ks = str(k)
+            if ks in ("HF_HOME", "HF_HOME_CONTAINER"):
+                continue
+            out[ks] = str(v)
+    return out
+
+
+def merge_environment_from_json_layers(
+    defaults: dict[str, Any],
+    suite_root: dict[str, Any],
+    run_layer: dict[str, Any],
+) -> dict[str, str]:
+    """Merge container ``-e`` variables: defaults, suite root, run (later wins)."""
+    out: dict[str, str] = {}
+    for d in (defaults, suite_root, run_layer):
+        out.update(_layer_environment_for_container(d))
+    return out
+
+
+def resolved_json_environment(cfg: dict[str, Any]) -> dict[str, str]:
+    """Effective JSON-sourced container env for a single merged run config."""
+    env = cfg.get("environment")
+    if isinstance(env, dict) and env:
+        return {str(k): str(v) for k, v in env.items()}
+    return _layer_environment_for_container(cfg)
 
 
 def effective_container_env(
@@ -308,28 +344,27 @@ def effective_container_env(
     cpu_visible_memory_nodes: str | None,
     omp_num_threads: str | None,
     extra_env_file: Path | None,
+    json_environment: dict[str, str] | None,
 ) -> dict[str, str]:
     """Environment variables passed into the container (-e), for tags and manifest."""
-    env: dict[str, str] = {
-        "VLLM_CPU_KVCACHE_SPACE": str(int(kv_cache_gb)),
-        "VLLM_CPU_OMP_THREADS_BIND": vllm_omp_threads_bind,
-        "HF_HOME": hf_home_container,
-    }
-    if cpu_visible_memory_nodes:
-        env["CPU_VISIBLE_MEMORY_NODES"] = cpu_visible_memory_nodes
-    if omp_num_threads:
-        env["OMP_NUM_THREADS"] = omp_num_threads
+    env: dict[str, str] = {}
     env.update(parse_extra_env_file(extra_env_file))
-    if "VLLM_CPU_KVCACHE_SPACE" in env:
-        try:
-            env["VLLM_CPU_KVCACHE_SPACE"] = str(
-                as_kv_cache_gib(env["VLLM_CPU_KVCACHE_SPACE"])
-            )
-        except ValueError as e:
-            raise ValueError(
-                "VLLM_CPU_KVCACHE_SPACE (from CLI or EXTRA_ENV_FILE) must be a "
-                f"non-negative integer GiB: {e}"
-            ) from e
+    if json_environment:
+        env.update(dict(json_environment))
+    env["VLLM_CPU_KVCACHE_SPACE"] = str(int(kv_cache_gb))
+    env["VLLM_CPU_OMP_THREADS_BIND"] = vllm_omp_threads_bind
+    env["HF_HOME"] = hf_home_container
+    if cpu_visible_memory_nodes:
+        env["CPU_VISIBLE_MEMORY_NODES"] = str(cpu_visible_memory_nodes)
+    if omp_num_threads:
+        env["OMP_NUM_THREADS"] = str(omp_num_threads)
+    try:
+        env["VLLM_CPU_KVCACHE_SPACE"] = str(as_kv_cache_gib(env["VLLM_CPU_KVCACHE_SPACE"]))
+    except ValueError as e:
+        raise ValueError(
+            "VLLM_CPU_KVCACHE_SPACE (from JSON, CLI, or extra env file) must be a "
+            f"non-negative integer GiB: {e}"
+        ) from e
     return env
 
 
@@ -413,19 +448,32 @@ def dashboard_version_for_import(
     return f"{base}-{proj}"
 
 
-def run_podman_detached(*, run_podman_sh: Path, env: dict[str, str]) -> None:
-    subprocess.run(
-        ["/usr/bin/env", "bash", str(run_podman_sh)],
-        env={**os.environ, **env},
-        check=True,
-        cwd=str(run_podman_sh.parent),
-    )
+def _parse_extra_docker_run_file(path: Path | None) -> list[str]:
+    """Lines from ``extra_docker_run_file``: each non-comment line split with ``shlex`` (before ``-v``)."""
+    if path is None or not path.is_file():
+        return []
+    argv_extra: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        argv_extra.extend(shlex.split(line))
+    return argv_extra
 
 
-def _podman_run_argv_from_env(e: dict[str, str], *, runtime: str) -> list[str]:
-    """Rebuild the ``podman|docker run ...`` argv (mirrors ``run_podman.sh``; omits file expansions)."""
+def _numactl_launch_prefix_argv(rr: ResolvedRun) -> list[str]:
+    n = str(rr.server_numa)
+    out = ["numactl", f"--cpunodebind={n}", f"--membind={n}"]
+    if rr.server_cpulist:
+        return ["taskset", "-c", str(rr.server_cpulist), *out]
+    return out
+
+
+def build_container_run_argv(rr: ResolvedRun) -> list[str]:
+    """``podman|docker run ...`` argv (detached, ``--replace`` for podman)."""
+    rt = rr.container_runtime
     parts: list[str] = [
-        runtime,
+        rt,
         "run",
         "--rm",
         "--network",
@@ -435,80 +483,48 @@ def _podman_run_argv_from_env(e: dict[str, str], *, runtime: str) -> list[str]:
         "--security-opt=label=disable",
         "--cap-add",
         "SYS_NICE",
-        f"--shm-size={e['SHM_SIZE']}",
+        f"--shm-size={rr.shm_size}",
         "-p",
-        f"{e['PORT']}:8000",
+        f"{rr.port}:8000",
         "--name",
-        e["CONTAINER_NAME"],
-        "-e",
-        f"VLLM_CPU_KVCACHE_SPACE={e['VLLM_CPU_KVCACHE_SPACE']}",
-        "-e",
-        f"VLLM_CPU_OMP_THREADS_BIND={e['VLLM_CPU_OMP_THREADS_BIND']}",
-        "-e",
-        f"HF_HOME={e['HF_HOME_CONTAINER']}",
+        rr.container_name,
     ]
-    if e.get("REPLACE_CONTAINER") == "1" and runtime == "podman":
+    if rt == "podman":
         parts.append("--replace")
-    if e.get("DETACHED") == "1":
-        parts.append("-d")
-    if e.get("CPU_VISIBLE_MEMORY_NODES"):
-        parts += ["-e", f"CPU_VISIBLE_MEMORY_NODES={e['CPU_VISIBLE_MEMORY_NODES']}"]
-    if e.get("OMP_NUM_THREADS"):
-        parts += ["-e", f"OMP_NUM_THREADS={e['OMP_NUM_THREADS']}"]
-    for k in (
-        "HF_TOKEN",
-        "HF_HUB_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
-        "HF_HUB_OFFLINE",
-        "HF_ENDPOINT",
-    ):
-        if k in e:
-            parts += ["-e", f"{k}={e[k]}"]
-    parts += ["-v", e["HF_HOME"]]
-    if str(e.get("VLLM_USE_IMAGE_ENTRYPOINT", "0")) == "1":
-        parts += [e["VLLM_IMAGE"], e["MODEL"]]
+    parts.append("-d")
+    for k, v in sorted(rr.container_env.items()):
+        parts += ["-e", f"{k}={v}"]
+    parts.extend(rr.extra_docker_run_argv)
+    parts += ["-v", rr.hf_home]
+    if rr.vllm_use_image_entrypoint:
+        parts += [rr.vllm_image, rr.model]
     else:
-        parts += ["--entrypoint", "vllm", e["VLLM_IMAGE"], "serve", e["MODEL"]]
-    extra = (e.get("VLLM_EXTRA_ARGS") or "").strip()
+        parts += ["--entrypoint", "vllm", rr.vllm_image, "serve", rr.model]
+    extra = (rr.vllm_extra or "").strip()
     if extra:
         parts.extend(shlex.split(extra))
     return parts
 
 
-def _numactl_launch_prefix_argv(e: dict[str, str]) -> list[str]:
-    n = str(e["SERVER_NUMA_NODE"])
-    out = ["numactl", f"--cpunodebind={n}", f"--membind={n}"]
-    if e.get("SERVER_CPULIST"):
-        return ["taskset", "-c", str(e["SERVER_CPULIST"]), *out]
-    return out
+def launch_vllm_container(rr: ResolvedRun) -> None:
+    """``numactl`` (+ optional ``taskset``) + container runtime ``run -d``."""
+    rt = rr.container_runtime
+    if rt == "docker":
+        subprocess.run(
+            [rt, "rm", "-f", rr.container_name],
+            capture_output=True,
+            text=True,
+        )
+    argv = _numactl_launch_prefix_argv(rr) + build_container_run_argv(rr)
+    subprocess.run(argv, check=True)
 
 
 def format_podman_launch_preview(rr: ResolvedRun) -> str:
-    """Human-readable orchestrator invocation and reconstructed container CLI."""
-    e = rr.podman_env
-    rt = str(e.get("CONTAINER_RUNTIME", rr.container_runtime))
+    """Human-readable full argv used to start the server container."""
     lines: list[str] = []
-    lines.append("=== Orchestrator (actual subprocess) ===")
-    lines.append(f"cwd: {rr.run_podman_script.parent}")
-    lines.append(f"argv: bash {shlex.quote(str(rr.run_podman_script))}")
-    lines.append("environment (merged with host env for this process):")
-    for k in sorted(e.keys()):
-        lines.append(f"  {k}={e[k]}")
-    lines.append("")
-    lines.append("=== Equivalent container run (reconstructed; must match run_podman.sh) ===")
-    inner = _podman_run_argv_from_env(e, runtime=rt)
-    prefix = _numactl_launch_prefix_argv(e)
-    lines.append(shlex.join(prefix + inner))
-    if e.get("EXTRA_ENV_FILE"):
-        lines.append(
-            f"# plus -e KEY=value for each non-comment line in: {e['EXTRA_ENV_FILE']}"
-        )
-    if e.get("EXTRA_DOCKER_RUN_FILE"):
-        lines.append(
-            f"# plus extra argv from each line in: {e['EXTRA_DOCKER_RUN_FILE']}"
-        )
-    if rt == "docker" and e.get("REPLACE_CONTAINER") == "1":
-        lines.append("# docker: run_podman.sh runs: docker rm -f CONTAINER_NAME before run")
+    lines.append("=== Container launch (Python-built argv) ===")
+    argv = _numactl_launch_prefix_argv(rr) + build_container_run_argv(rr)
+    lines.append(shlex.join(argv))
     lines.append("")
     return "\n".join(lines)
 
@@ -879,9 +895,12 @@ class ResolvedRun:
     out_json: str
     container_name: str
     container_runtime: str
+    # Final ``-e`` map (JSON + optional env file + orchestrator overrides).
     container_env: dict[str, str]
-    podman_env: dict[str, str]
-    run_podman_script: Path
+    # JSON merge only (``environment`` / ``container_env`` / non-bind ``launch_env``).
+    environment_from_json: dict[str, str]
+    extra_docker_run_argv: list[str]
+    vllm_use_image_entrypoint: bool
     guidellm_bin: Path
     guidellm_subprocess_env: dict[str, str]
     launch_env_user: dict[str, str]
@@ -889,7 +908,6 @@ class ResolvedRun:
     run_name_ml: str
     user_mlflow_tags: dict[str, str] = field(default_factory=dict)
     extra_env_file_path: Path | None = None
-    container_env_inline: dict[str, str] = field(default_factory=dict)
     dashboard_version: str = DEFAULT_DASHBOARD_IMPORT_VERSION
 
 
@@ -906,12 +924,6 @@ def _resolve_guidellm_bin(cfg: dict[str, Any], args: argparse.Namespace) -> Path
     if cfg.get("guidellm_venv"):
         return Path(str(cfg["guidellm_venv"])).expanduser() / "bin" / "guidellm"
     return Path(args.guidellm_bin).expanduser()
-
-
-def _resolve_run_podman_script(cfg: dict[str, Any], args: argparse.Namespace) -> Path:
-    if cfg.get("run_podman_script"):
-        return Path(str(cfg["run_podman_script"])).expanduser()
-    return Path(args.run_podman_script).expanduser()
 
 
 def _truncate_for_plot(s: str, max_len: int) -> str:
@@ -1065,22 +1077,12 @@ def _parse_env_file_lines(text: str) -> dict[str, str]:
     return out
 
 
-def materialize_merged_extra_env(rr: ResolvedRun) -> None:
-    """If JSON ``container_env`` is set, merge with optional ``extra_env_file`` and set EXTRA_ENV_FILE."""
-    if not rr.container_env_inline:
-        return
-    merged: dict[str, str] = {}
-    if rr.extra_env_file_path is not None and rr.extra_env_file_path.is_file():
-        merged.update(
-            _parse_env_file_lines(
-                rr.extra_env_file_path.read_text(encoding="utf-8")
-            )
-        )
-    merged.update(rr.container_env_inline)
-    path = rr.run_dir / "container_extra_env_merged.env"
-    body = "\n".join(f"{k}={v}" for k, v in sorted(merged.items())) + "\n"
+def write_resolved_environment_artifact(rr: ResolvedRun) -> None:
+    """Write ``container_environment_resolved.env`` (redacted copy for logs / MLflow)."""
+    path = rr.run_dir / "container_environment_resolved.env"
+    red = _redact_launch_env_for_manifest(rr.container_env)
+    body = "\n".join(f"{k}={v}" for k, v in sorted(red.items())) + "\n"
     path.write_text(body, encoding="utf-8")
-    rr.podman_env["EXTRA_ENV_FILE"] = str(path.resolve())
 
 
 def iter_benchmark_artifact_paths(rr: ResolvedRun) -> list[Path]:
@@ -1095,7 +1097,7 @@ def iter_benchmark_artifact_paths(rr: ResolvedRun) -> list[Path]:
         rr.run_dir / "system_numactl_show.txt",
         rr.run_dir / "system_free.txt",
         rr.run_dir / "system_uname.txt",
-        rr.run_dir / "container_extra_env_merged.env",
+        rr.run_dir / "container_environment_resolved.env",
         rr.run_dir / "vllm_server.log",
         rr.run_dir / "host_samples.tsv",
         gj,
@@ -1163,6 +1165,9 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
     cpu_vis = cfg.get("cpu_visible_memory_nodes", args.cpu_visible_memory_nodes)
     omp_threads = cfg.get("omp_num_threads", args.omp_num_threads)
 
+    json_env = resolved_json_environment(cfg)
+    environment_from_json = dict(json_env)
+
     try:
         container_env = effective_container_env(
             kv_cache_gb=kv,
@@ -1171,62 +1176,17 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
             cpu_visible_memory_nodes=str(cpu_vis) if cpu_vis else None,
             omp_num_threads=str(omp_threads) if omp_threads else None,
             extra_env_file=extra_path,
+            json_environment=json_env if json_env else None,
         )
     except ValueError as e:
         print(str(e), file=sys.stderr)
         raise SystemExit(2) from e
 
-    inline_env_raw = cfg.get("container_env")
-    container_env_inline: dict[str, str] = {}
-    if isinstance(inline_env_raw, dict):
-        container_env_inline = {str(k): str(v) for k, v in inline_env_raw.items()}
-    if container_env_inline:
-        container_env = dict(container_env)
-        container_env.update(container_env_inline)
-        if "VLLM_CPU_KVCACHE_SPACE" in container_env:
-            try:
-                container_env["VLLM_CPU_KVCACHE_SPACE"] = str(
-                    as_kv_cache_gib(container_env["VLLM_CPU_KVCACHE_SPACE"])
-                )
-            except ValueError as e:
-                print(f"Invalid VLLM_CPU_KVCACHE_SPACE in container_env: {e}", file=sys.stderr)
-                raise SystemExit(2) from e
-
-    podman_env: dict[str, str] = {
-        "DETACHED": "1",
-        "REPLACE_CONTAINER": "1",
-        "CONTAINER_NAME": container_name,
-        "CONTAINER_RUNTIME": args.container_runtime,
-        "MODEL": model,
-        "VLLM_IMAGE": vllm_image,
-        "VLLM_EXTRA_ARGS": vllm_extra,
-        "PORT": str(port),
-        "VLLM_CPU_KVCACHE_SPACE": str(int(kv)),
-        "SERVER_NUMA_NODE": str(server_numa),
-        "SHM_SIZE": shm_size,
-        "HF_HOME": hf_home,
-        "HF_HOME_CONTAINER": hf_home_container,
-        "VLLM_CPU_OMP_THREADS_BIND": vllm_omp,
-    }
-    if server_cpulist:
-        podman_env["SERVER_CPULIST"] = str(server_cpulist)
-    if extra_path and not container_env_inline:
-        podman_env["EXTRA_ENV_FILE"] = str(extra_path)
-    if cpu_vis:
-        podman_env["CPU_VISIBLE_MEMORY_NODES"] = str(cpu_vis)
-    if omp_threads:
-        podman_env["OMP_NUM_THREADS"] = str(omp_threads)
     edf = cfg.get("extra_docker_run_file", args.extra_docker_run_file)
-    if edf:
-        podman_env["EXTRA_DOCKER_RUN_FILE"] = str(edf)
-    if cfg.get("vllm_use_image_entrypoint"):
-        podman_env["VLLM_USE_IMAGE_ENTRYPOINT"] = "1"
-
-    podman_env.update(launch_env_user)
-    podman_env["DETACHED"] = "1"
-    podman_env["REPLACE_CONTAINER"] = "1"
-    podman_env["CONTAINER_NAME"] = container_name
-    podman_env["CONTAINER_RUNTIME"] = args.container_runtime
+    extra_docker_argv = _parse_extra_docker_run_file(
+        Path(str(edf)).expanduser() if edf is not None else None
+    )
+    vllm_use_image_entrypoint = bool(cfg.get("vllm_use_image_entrypoint"))
 
     utags: dict[str, str] = {}
     cfg_tags = cfg.get("mlflow_tags")
@@ -1237,7 +1197,6 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
 
     dashboard_version = str(cfg.get("dashboard_version", args.dashboard_version))
 
-    run_podman_script = _resolve_run_podman_script(cfg, args)
     guidellm_bin = _resolve_guidellm_bin(cfg, args)
     guidellm_subprocess_env = _parse_guidellm_env(cfg)
 
@@ -1256,8 +1215,8 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
         port=port,
         max_seconds=max_seconds,
         shm_size=shm_size,
-        hf_home=podman_env["HF_HOME"],
-        hf_home_container=podman_env["HF_HOME_CONTAINER"],
+        hf_home=hf_home,
+        hf_home_container=hf_home_container,
         vllm_omp_threads_bind=vllm_omp,
         run_id=run_id,
         run_dir=run_dir,
@@ -1265,8 +1224,9 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
         container_name=container_name,
         container_runtime=args.container_runtime,
         container_env=container_env,
-        podman_env=podman_env,
-        run_podman_script=run_podman_script,
+        environment_from_json=environment_from_json,
+        extra_docker_run_argv=extra_docker_argv,
+        vllm_use_image_entrypoint=vllm_use_image_entrypoint,
         guidellm_bin=guidellm_bin,
         guidellm_subprocess_env=guidellm_subprocess_env,
         launch_env_user=dict(launch_env_user),
@@ -1274,7 +1234,6 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
         run_name_ml=str(cfg.get("run_name", run_id))[:250],
         user_mlflow_tags=utags,
         extra_env_file_path=extra_path,
-        container_env_inline=container_env_inline,
         dashboard_version=dashboard_version,
     )
 
@@ -1291,7 +1250,7 @@ def execute_benchmark_phase(
             json.dumps(run_config, indent=2, default=str),
             encoding="utf-8",
         )
-    materialize_merged_extra_env(rr)
+    write_resolved_environment_artifact(rr)
     manifest = {
         "run_id": rr.run_id,
         "model": rr.model,
@@ -1307,10 +1266,12 @@ def execute_benchmark_phase(
         "port": rr.port,
         "container_name": rr.container_name,
         "vllm_image": rr.vllm_image,
-        "container_env": rr.container_env,
-        "podman_launch_env": {k: v for k, v in rr.podman_env.items() if k != "DETACHED"},
+        "container_env": _redact_launch_env_for_manifest(rr.container_env),
+        "environment_from_json": _redact_launch_env_for_manifest(rr.environment_from_json),
+        "container_run_argv": shlex.join(
+            _numactl_launch_prefix_argv(rr) + build_container_run_argv(rr)
+        ),
         "dashboard_version": rr.dashboard_version,
-        "run_podman_script": str(rr.run_podman_script),
         "guidellm_bin": str(rr.guidellm_bin),
         "guidellm_subprocess_env": rr.guidellm_subprocess_env,
         "launch_env": _redact_launch_env_for_manifest(rr.launch_env_user),
@@ -1336,7 +1297,7 @@ def execute_benchmark_phase(
     try:
         print("Starting vLLM container...", flush=True)
         log_podman_launch_preview(rr)
-        run_podman_detached(run_podman_sh=rr.run_podman_script, env=rr.podman_env)
+        launch_vllm_container(rr)
         time.sleep(1)
         logs_p = start_log_follower(
             runtime=rr.container_runtime,
@@ -1499,8 +1460,12 @@ def finalize_after_benchmark(rr: ResolvedRun, args: argparse.Namespace) -> None:
 
 def single_benchmark(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     rr = resolve_run(cfg, args)
-    if not rr.run_podman_script.is_file():
-        print(f"Missing run_podman script {rr.run_podman_script}", file=sys.stderr)
+    runtime_bin = shutil.which(rr.container_runtime)
+    if not runtime_bin:
+        print(
+            f"Container runtime {rr.container_runtime!r} not found on PATH",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
     if not rr.guidellm_bin.is_file():
         print(f"Missing GuideLLM binary {rr.guidellm_bin}", file=sys.stderr)
@@ -1545,6 +1510,10 @@ def run_suite_from_json_path(config_path: Path, args: argparse.Namespace) -> Non
         lev = merge_launch_env_from_json_layers(defaults_dict, data, run_cfg)
         if lev:
             merged["launch_env"] = lev
+        env_merged = merge_environment_from_json_layers(defaults_dict, data, run_cfg)
+        if env_merged:
+            merged["environment"] = env_merged
+        merged.pop("container_env", None)
         merged.setdefault("experiment", global_exp)
         mtags = {**default_tags}
         rt = merged.get("mlflow_tags")
@@ -1572,12 +1541,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-base", type=Path, default=HOME / "results" / "vllm_guidellm_runs")
 
     p.add_argument(
-        "--run-podman-script",
-        type=Path,
-        default=discover_run_podman_script(),
-        help="Path to run_podman.sh (default: next to this script, then CWD, then ~/run_podman.sh)",
-    )
-    p.add_argument(
         "--guidellm-bin",
         type=Path,
         default=discover_guidellm_bin(),
@@ -1600,7 +1563,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--hf-home",
         default="/home/naveen/models:/models",
-        help="Value for HF_HOME passed to run_podman.sh (Podman -v bind; used as-is).",
+        help="Podman/Docker -v bind (host:container path), used as-is.",
     )
     p.add_argument(
         "--hf-cache-volume",
@@ -1694,6 +1657,8 @@ def main() -> None:
             "run_name": args.run_name,
             "mlflow_tags": args.mlflow_tags or {},
             "hf_home": args.hf_home,
+            "hf_home_container": args.hf_home_container,
+            "environment": {},
         }
         single_benchmark(cfg, args)
 

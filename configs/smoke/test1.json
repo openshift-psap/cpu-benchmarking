@@ -5,8 +5,10 @@
     "server_numa": 1,
     "client_numa": 0,
     "max_seconds": 10,
+    "hf_home": "/home/nmiriyal/models:/models",
+    "hf_home_container": "/models",
     "vllm_extra_args": "--dtype=bfloat16 --max-num-batched-tokens 2048",
-     "container_env": {
+    "environment": {
       "VLLM_CPU_OMP_THREADS_BIND": "auto",
       "VLLM_CPU_NUM_OF_RESERVED_CPU": "1",
       "CPU_VISIBLE_MEMORY_NODES": "1",
@@ -22,7 +24,7 @@
       "osl": 128,
       "rate": "1,2",
       "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 2048",
-      "mlflow_tags": { "project": "kvcache-study","variant": "kv64" }
+      "mlflow_tags": { "project": "kvcache-study", "variant": "kv64" }
     },
     {
       "run_name": "llam-qwen-kv128-c8-run2",
@@ -32,7 +34,7 @@
       "osl": 128,
       "rate": "1,2",
       "vllm_extra_args": "--dtype=bfloat16 --max-model-len 4096 --max-num-batched-tokens 2048",
-      "mlflow_tags": { "project": "kvcache-study","variant": "kv128" }
+      "mlflow_tags": { "project": "kvcache-study", "variant": "kv128" }
     }
   ]
 }

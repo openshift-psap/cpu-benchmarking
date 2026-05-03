@@ -1,0 +1,198 @@
+{
+  "experiment": "isl-sweep-single-cpu-osl1",
+  "description": "Single pinned CPU (taskset + omp) sweep of input sequence length (ISL) with OSL=1. Edit hf_home, model, and max_seconds for your host. vllm_extra_args uses max-model-len 8192 so the largest ISL fits; reduce kv_cache_gb if memory is tight.",
+  "defaults": {
+    "server_numa": 0,
+    "client_numa": 0,
+    "server_cpulist": "0",
+    "omp_num_threads": 1,
+    "max_seconds": 120,
+    "rate": "1",
+    "osl": 1,
+    "kv_cache_gb": 8,
+    "port": 8000,
+    "shm_size": "4g",
+    "vllm_image": "docker.io/vllm/vllm-openai-cpu:v0.18.0",
+    "vllm_extra_args": "--dtype=bfloat16 --max-model-len 8192 --max-num-batched-tokens 8192",
+    "hf_home": "/path/on/host/models:/models",
+    "hf_home_container": "/models",
+    "output_dir": "./results/isl_sweep_single_cpu",
+    "environment": {
+      "OMP_NUM_THREADS": "1",
+      "VLLM_CPU_OMP_THREADS_BIND": "0",
+      "HF_HUB_OFFLINE": "1"
+    }
+  },
+  "runs": [
+    {
+      "run_name": "qwen06b-isl16-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 16,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "16"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl24-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 24,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "24"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl32-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 32,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "32"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl48-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 48,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "48"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl64-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 64,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "64"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl96-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 96,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "96"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl128-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 128,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "128"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl192-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 192,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "192"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl256-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 256,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "256"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl384-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 384,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "384"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl512-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 512,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "512"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl768-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 768,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "768"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl1024-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 1024,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "1024"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl1280-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 1280,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "1280"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl1536-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 1536,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "1536"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl1792-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 1792,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "1792"
+      }
+    },
+    {
+      "run_name": "qwen06b-isl2048-osl1-cpu0",
+      "model": "Qwen/Qwen3-0.6B",
+      "isl": 2048,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "2048"
+      }
+    }
+  ]
+}

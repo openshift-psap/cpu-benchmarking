@@ -1,0 +1,30 @@
+{
+  "experiment": "smoke-suite-root-env",
+  "environment": {
+    "HF_HUB_OFFLINE": "1",
+    "VLLM_CPU_OMP_THREADS_BIND": "auto"
+  },
+  "defaults": {
+    "output_dir": "./results/smoke",
+    "server_numa": 0,
+    "client_numa": 0,
+    "max_seconds": 5,
+    "kv_cache_gb": 8,
+    "isl": 32,
+    "osl": 32,
+    "rate": "1",
+    "vllm_image": "docker.io/vllm/vllm-openai-cpu:v0.18.0",
+    "vllm_extra_args": "--dtype=bfloat16 --max-model-len 512",
+    "hf_home": "/tmp/models-smoke:/models",
+    "hf_home_container": "/models"
+  },
+  "runs": [
+    {
+      "run_name": "smoke-root-env-merge",
+      "model": "Qwen/Qwen3-0.6B",
+      "environment": {
+        "OMP_NUM_THREADS": "4"
+      }
+    }
+  ]
+}

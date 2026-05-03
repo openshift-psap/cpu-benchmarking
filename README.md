@@ -1,27 +1,28 @@
 # cpu-benchmarking
 
-Orchestration for **vLLM in Podman** (or Docker via `CONTAINER_RUNTIME`) plus **GuideLLM** load tests: start the server, sample host metrics, run GuideLLM, stop the container, optionally write dashboard CSV / plots and upload to MLflow.
+Orchestration for **vLLM in Podman** (or Docker via `CONTAINER_RUNTIME`) plus **GuideLLM** load tests: build the `podman|docker run` argv in Python, start the server detached, sample host metrics, run GuideLLM, stop the container, optionally write dashboard CSV / plots and upload to MLflow.
 
-For a file-by-file map of `cpu_vllm_bench.py`, see [README_CODE.md](README_CODE.md).
+- **Code structure**: [README_CODE.md](README_CODE.md)
+- **Copy-paste examples**: [README_USAGE.md](README_USAGE.md)
 
 ## Layout
 
-Place **`run_podman.sh`** in the same directory as `cpu_vllm_bench.py`, or in your current working directory when you launch the benchmark. The script picks the first existing path in this order: next to `cpu_vllm_bench.py`, then `./run_podman.sh` under the process CWD, then `~/run_podman.sh`. Override with `--run-podman-script` or JSON `run_podman_script`.
-
-Similarly, **`guidellm_env/bin/guidellm`** next to `cpu_vllm_bench.py` is preferred over `~/guidellm_env/bin/guidellm`. Override with `--guidellm-bin`, `guidellm_bin`, or `guidellm_venv` in JSON.
+- **`cpu_vllm_bench.py`** — Orchestrator; constructs the container command and runs it via `subprocess` (no `bash run_podman.sh` in the default path).
+- **`guidellm_env/bin/guidellm`** next to this script is preferred over `~/guidellm_env/bin/guidellm`. Override with `--guidellm-bin`, JSON `guidellm_bin`, or `guidellm_venv`.
+- **`run_podman.sh`** — Optional **manual** launcher for debugging; see [Legacy run_podman.sh](#legacy-run_podmansh).
 
 ## Prerequisites
 
-- **Container runtime**: Podman (default) or Docker; set `CONTAINER_RUNTIME` if not using Podman.
-- **Host tools**: `numactl` (GuideLLM is launched under NUMA bind), `bash`, Python 3.
-- **GuideLLM**: install the CLI and ensure the binary exists (see defaults above).
-- **vLLM image**: e.g. `vllm/vllm-openai-cpu:v0.18.0` (override with `--vllm-image` or JSON `vllm_image`).
-- **Models**: `run_podman.sh` uses **`HF_HOME`** as the **`-v` bind** string passed through unchanged (typically `host_path:container_path`), and **`HF_HOME_CONTAINER`** as the in-container path for `-e HF_HOME=...`. Set them from JSON (`hf_home`, `hf_home_container`), from **`launch_env`** (`HF_HOME`, `HF_HOME_CONTAINER`), or from CLI. **`launch_env`** is merged into the `run_podman.sh` process environment; keys such as **`HF_TOKEN`** are forwarded into the container by `run_podman.sh` (see script header).
+- **Container runtime**: Podman (default) or Docker on `PATH`; override with `--container-runtime` or `CONTAINER_RUNTIME`.
+- **Host tools**: `numactl` (server and GuideLLM are launched under NUMA bind), Python 3.
+- **GuideLLM**: install the CLI and ensure the binary exists (see above).
+- **vLLM image**: e.g. `docker.io/vllm/vllm-openai-cpu:v0.18.0` (`--vllm-image` or JSON `vllm_image`).
+- **Models / cache**: set **`hf_home`** (host:container bind for `podman run -v`) and **`hf_home_container`** (in-container cache root; passed as `-e HF_HOME=...`). Optionally override the bind with **`launch_env.HF_HOME`** / **`launch_env.HF_HOME_CONTAINER`** (merged across suite layers). Tokens and Hub flags belong in JSON **`environment`** (see below).
 
 Optional:
 
 - **MLflow**: `pip install mlflow`; set `MLFLOW_TRACKING_URI` (e.g. `http://127.0.0.1:5000`) to match `mlflow server`.
-- **Dashboard CSV / graphs**: performance-dashboard `import_manual_runs_json_v2.py` path via `--import-script`; graphs need `matplotlib` and `pandas`.
+- **Dashboard CSV / graphs**: performance-dashboard `import_manual_runs_json_v2.py` via `--import-script`; graphs need `matplotlib` and `pandas`.
 
 ## Quick start (CLI only)
 
@@ -30,119 +31,65 @@ From this directory:
 ```bash
 python3 cpu_vllm_bench.py \
   --model Qwen/Qwen3-1.7B \
-  --vllm-image vllm/vllm-openai-cpu:v0.18.0 \
+  --vllm-image docker.io/vllm/vllm-openai-cpu:v0.18.0 \
   --hf-home /path/on/host:/models \
+  --hf-home-container /models \
   --isl 128 --osl 128 --rate "1,2" \
   --output-base ./results
 ```
 
 Add `--mlflow` (and/or `--mlflow-tracking-uri`) to log a run. Use `--no-mlflow` to force-disable when the env sets `MLFLOW_TRACKING_URI`.
 
+More examples: [README_USAGE.md](README_USAGE.md).
+
 ## Suite JSON (`--config`)
 
-Pass one or more JSON files; each file is executed in order. Every file must contain a **`runs`** array. Optional top-level keys:
+Pass one or more JSON files; each file is executed in order. Every file must contain a **`runs`** array.
+
+### Shallow merge (per run)
+
+Merge order: **`defaults`** → suite-level tooling keys → each **`runs[]`** object. Tooling keys copied from the suite root include: `guidellm_bin`, `guidellm_venv`, `guidellm_env`, `run_podman_script` (ignored by the launcher; kept for documentation / old configs), `hf_home`, `hf_home_container`, `hf_cache_volume`.
+
+### Deep merge: `launch_env` (bind overrides only for two keys)
+
+**`launch_env`** is merged from `defaults`, suite root, and each run via **`merge_launch_env_from_json_layers()`**. Keys **`HF_HOME`** and **`HF_HOME_CONTAINER`** override the top-level `hf_home` / `hf_home_container` for the **volume bind** and **inner** `-e HF_HOME=...`. Other `launch_env` keys are **also** folded into the container **`environment`** merge (same as `environment` / `container_env`), except those two bind keys which are not duplicated as arbitrary `-e` values.
+
+### Deep merge: `environment` (normal way for container `-e`)
+
+Use the **`environment`** object for Hugging Face tokens, `HF_HUB_OFFLINE`, extra vLLM variables, etc. Merged across **`defaults`**, suite root, and each run (later wins on the same key). Deprecated alias: **`container_env`** (same merge).
+
+The orchestrator **always** reapplies `kv_cache_gb` → `VLLM_CPU_KVCACHE_SPACE`, `hf_home_container` → inner `HF_HOME`, and `vllm_omp_threads_bind` after your JSON so benchmark settings stay consistent.
+
+### Optional suite keys
 
 | Key | Purpose |
 | --- | --- |
 | `defaults` | Merged into each run before run-specific fields. |
 | `experiment` | Default MLflow experiment name. |
 | `mlflow_tags` | Default tags (merged with per-run `mlflow_tags`). |
-| `guidellm_bin` | Path to the `guidellm` executable (string). |
-| `guidellm_venv` | Virtualenv root; binary used is `<venv>/bin/guidellm` if `guidellm_bin` is not set. |
-| `guidellm_env` | Object of extra environment variables for the GuideLLM subprocess only (e.g. `PATH`, `HTTP_PROXY`). |
-| `run_podman_script` | Path to `run_podman.sh`. |
-| `hf_home` | Volume bind passed to `run_podman.sh` as `HF_HOME` (used as-is for `podman run -v`). |
-| `hf_home_container` | In-container cache path; passed as `HF_HOME_CONTAINER` (default often `/models`). |
-| `hf_cache_volume` | Deprecated alias for `hf_home` (same as in CLI). |
-| `launch_env` | Object merged into the **`run_podman.sh`** environment (later layers override). Use for `HF_HOME`, `HF_HOME_CONTAINER`, `HF_TOKEN`, etc. **`launch_env`** is deep-merged from `defaults.launch_env`, suite root `launch_env`, then each run’s `launch_env`. After merge, `HF_HOME` / `HF_HOME_CONTAINER` in **`launch_env`** override the top-level `hf_home` / `hf_home_container` keys for volume bind and inner `HF_HOME`. |
+| `environment` | Container `-e` variables (merged across layers). |
+| `container_env` | Deprecated; merged like `environment`. |
+| `launch_env` | Bind overrides (`HF_HOME`, `HF_HOME_CONTAINER`) + other keys merged into container env (except the two bind keys as `-e`). |
+| `guidellm_bin` / `guidellm_venv` / `guidellm_env` | GuideLLM binary and subprocess env. |
+| `hf_home` / `hf_home_container` / `hf_cache_volume` | Volume bind and inner cache path (`hf_cache_volume` is a deprecated alias for `hf_home`). |
+| `extra_docker_run_file` | File of extra `run` argv lines (parsed with `shlex`, inserted before `-v`). |
+| `extra_env_file` | Host file of `KEY=value` lines merged into container env before JSON `environment`. |
+| `vllm_use_image_entrypoint` | If `true`, run `IMAGE MODEL` only (use the image’s `ENTRYPOINT`/`CMD`). If `false` (default), run `--entrypoint vllm … serve MODEL` plus `vllm_extra_args`. See section 10 in [README_USAGE.md](README_USAGE.md). |
 
-Per-run objects in `runs` can override any of the above. Merge order: `defaults` → suite-level keys (`guidellm_*`, `run_podman_script`, `hf_home`, `hf_home_container`, `hf_cache_volume`) → each run entry; **`launch_env`** is merged separately across defaults, suite root, and run (see table).
+Before each container start, the orchestrator **prints** and saves **`podman_launch_preview.txt`**: the **exact argv** used (`numactl` / `taskset` + `podman|docker run ...`).
 
-Before each container start, the orchestrator **prints** (and saves under the run directory as **`podman_launch_preview.txt`**) the environment passed into `run_podman.sh` and a **reconstructed** `podman run` / `docker run` one-liner that should match `run_podman.sh` (file-based `EXTRA_ENV_FILE` / `EXTRA_DOCKER_RUN_FILE` expansions are called out in comments there).
-
-## `run_podman.sh` usage examples
-
-The script reads **environment variables** and runs **`numactl`** (and optionally **`taskset`**) in front of **`podman run`** or **`docker run`**. The orchestrator always sets `DETACHED=1` and `REPLACE_CONTAINER=1` when it calls the script.
-
-### Minimal foreground run (same shell, logs attached)
-
-```bash
-cd /path/to/cpu-benchmarking
-MODEL=Qwen/Qwen3-1.7B \
-VLLM_CPU_KVCACHE_SPACE=64 \
-HF_HOME=/srv/huggingface:/models \
-HF_HOME_CONTAINER=/models \
-bash run_podman.sh
-```
-
-### Detached server (what the Python orchestrator emulates)
-
-```bash
-MODEL=Qwen/Qwen3-1.7B \
-VLLM_IMAGE=vllm/vllm-openai-cpu:v0.18.0 \
-VLLM_EXTRA_ARGS='--dtype=bfloat16 --max-model-len 4096' \
-PORT=8000 \
-SHM_SIZE=8g \
-HF_HOME=/srv/huggingface:/models \
-HF_HOME_CONTAINER=/models \
-VLLM_CPU_KVCACHE_SPACE=128 \
-SERVER_NUMA_NODE=1 \
-CONTAINER_NAME=vllm-bench-001 \
-DETACHED=1 \
-REPLACE_CONTAINER=1 \
-bash run_podman.sh
-```
-
-### Pin server CPUs on the NUMA node (`taskset`)
-
-```bash
-MODEL=Qwen/Qwen3-1.7B \
-SERVER_NUMA_NODE=1 \
-SERVER_CPULIST=8-15 \
-HF_HOME=/srv/huggingface:/models \
-DETACHED=1 \
-REPLACE_CONTAINER=1 \
-CONTAINER_NAME=vllm-cpupin \
-bash run_podman.sh
-```
-
-### Extra container env from a file (`-e` per line)
-
-```bash
-# my.env lines look like: FOO=bar
-MODEL=Qwen/Qwen3-1.7B \
-EXTRA_ENV_FILE=./my.env \
-HF_HOME=/srv/huggingface:/models \
-DETACHED=1 \
-REPLACE_CONTAINER=1 \
-CONTAINER_NAME=vllm-extraenv \
-bash run_podman.sh
-```
-
-### Docker instead of Podman
-
-```bash
-CONTAINER_RUNTIME=docker \
-MODEL=Qwen/Qwen3-1.7B \
-HF_HOME=/srv/huggingface:/models \
-DETACHED=1 \
-REPLACE_CONTAINER=1 \
-CONTAINER_NAME=vllm-docker \
-bash run_podman.sh
-```
-
-### Match the orchestrator’s environment (illustrative)
-
-The Python code builds the `run_podman.sh` environment from JSON/CLI fields, then applies **`launch_env`** on top (verbatim string values). It always sets `DETACHED=1`, `REPLACE_CONTAINER=1`, and `CONTAINER_NAME` after that merge. Inspect **`podman_launch_preview.txt`** in a run directory for the exact values for that run.
-
-**`launch_env` vs `container_env`**: `launch_env` feeds the **host** script that runs Podman (volume bind `HF_HOME`, tokens forwarded by `run_podman.sh`, etc.). `container_env` is merged into the **extra `-e` file** for variables that should appear only inside the container (see `materialize_merged_extra_env` in the code map).
-
-### Example JSON files (in-repo)
+## Example JSON files (in-repo)
 
 | File | Purpose |
 | --- | --- |
-| [`configs/examples/minimal-suite.json`](configs/examples/minimal-suite.json) | Smallest suite: shared `defaults`, one run. Edit `hf_home`, `output_dir`, and model paths for your host. |
-| [`configs/examples/suite-with-tooling-paths.json`](configs/examples/suite-with-tooling-paths.json) | Same idea plus suite-level `run_podman_script`, `guidellm_venv`, `guidellm_env`, and a per-run `guidellm_bin` override on the second entry. Replace placeholder paths. |
+| [configs/examples/minimal-suite.json](configs/examples/minimal-suite.json) | Smallest suite: shared `defaults`, one run. Edit `hf_home`, `output_dir`, model. |
+| [configs/examples/suite-with-tooling-paths.json](configs/examples/suite-with-tooling-paths.json) | Suite-level paths for GuideLLM; optional `run_podman_script` is ignored by the Python launcher. |
+| [configs/smoke/environment-minimal.json](configs/smoke/environment-minimal.json) | Smoke: canonical **`environment`**. |
+| [configs/smoke/legacy-container-env.json](configs/smoke/legacy-container-env.json) | Smoke: deprecated **`container_env`**. |
+| [configs/smoke/suite-root-environment.json](configs/smoke/suite-root-environment.json) | Smoke: suite root + per-run **`environment`**. |
+| [configs/smoke/test1.json](configs/smoke/test1.json) | Larger Llama-style settings; set secrets locally. |
+| [configs/examples/isl-sweep-single-cpu-osl1.json](configs/examples/isl-sweep-single-cpu-osl1.json) | Single CPU (`server_cpulist`, `omp_num_threads`), **OSL=1**, ISL grid **16–2048** (17 runs). |
+| [configs/examples/entrypoint-image-default.json](configs/examples/entrypoint-image-default.json) | **`vllm_use_image_entrypoint`: true** — rely on image `ENTRYPOINT`/`CMD`. |
 
 Minimal suite (inline copy):
 
@@ -157,47 +104,17 @@ Minimal suite (inline copy):
     "osl": 128,
     "rate": "1,2",
     "kv_cache_gb": 32,
-    "vllm_image": "vllm/vllm-openai-cpu:v0.18.0",
+    "vllm_image": "docker.io/vllm/vllm-openai-cpu:v0.18.0",
     "vllm_extra_args": "--dtype=bfloat16",
     "hf_home": "/path/on/host/models:/models",
-    "output_dir": "./results"
+    "hf_home_container": "/models",
+    "output_dir": "./results",
+    "environment": {
+      "HF_HUB_OFFLINE": "1"
+    }
   },
   "runs": [
     { "run_name": "example-qwen-smoke", "model": "Qwen/Qwen3-1.7B" }
-  ]
-}
-```
-
-Suite with explicit GuideLLM / Podman paths (inline copy; adjust paths):
-
-```json
-{
-  "experiment": "example-tooling",
-  "run_podman_script": "/path/to/cpu-benchmarking/run_podman.sh",
-  "guidellm_venv": "/path/to/guidellm_env",
-  "guidellm_env": {
-    "PATH": "/path/to/guidellm_env/bin:/usr/bin:/bin"
-  },
-  "defaults": {
-    "server_numa": 1,
-    "client_numa": 0,
-    "max_seconds": 120,
-    "isl": 128,
-    "osl": 128,
-    "rate": "1,2,4",
-    "kv_cache_gb": 64,
-    "vllm_image": "vllm/vllm-openai-cpu:v0.18.0",
-    "vllm_extra_args": "--dtype=bfloat16",
-    "hf_home": "/path/on/host/models:/models",
-    "output_dir": "./results"
-  },
-  "runs": [
-    { "run_name": "run-a", "model": "Qwen/Qwen3-1.7B" },
-    {
-      "run_name": "run-b-other-guidellm",
-      "model": "Qwen/Qwen3-1.7B",
-      "guidellm_bin": "/opt/other_venv/bin/guidellm"
-    }
   ]
 }
 ```
@@ -210,36 +127,60 @@ python3 cpu_vllm_bench.py \
   --output-base ./results
 ```
 
-Existing smoke config:
+## Legacy run_podman.sh
+
+The shell script is **not** used by `cpu_vllm_bench.py`. It remains useful for foreground or ad-hoc detached runs. It reads the same conceptual variables (`MODEL`, `HF_HOME`, `VLLM_CPU_KVCACHE_SPACE`, …); see the header comments in [run_podman.sh](run_podman.sh).
+
+### Minimal foreground run
 
 ```bash
-python3 cpu_vllm_bench.py \
-  --config configs/smoke/test1.json \
-  --output-base ./results \
-  --mlflow
+cd /path/to/cpu-benchmarking
+MODEL=Qwen/Qwen3-1.7B \
+VLLM_CPU_KVCACHE_SPACE=64 \
+HF_HOME=/srv/huggingface:/models \
+HF_HOME_CONTAINER=/models \
+bash run_podman.sh
+```
+
+### Detached (similar flags to the Python path)
+
+```bash
+MODEL=Qwen/Qwen3-1.7B \
+VLLM_IMAGE=docker.io/vllm/vllm-openai-cpu:v0.18.0 \
+VLLM_EXTRA_ARGS='--dtype=bfloat16 --max-model-len 4096' \
+PORT=8000 \
+HF_HOME=/srv/huggingface:/models \
+HF_HOME_CONTAINER=/models \
+VLLM_CPU_KVCACHE_SPACE=128 \
+SERVER_NUMA_NODE=1 \
+CONTAINER_NAME=vllm-bench-001 \
+DETACHED=1 \
+REPLACE_CONTAINER=1 \
+bash run_podman.sh
 ```
 
 ## Troubleshooting
 
 ### `LocalEntryNotFoundError` / “outgoing traffic has been disabled”
 
-This comes from **Hugging Face Hub** when **`HF_HUB_OFFLINE=1`** (or equivalent) is set **and** the model revision is not fully present under your cache mount. The smoke config [`configs/smoke/test1.json`](configs/smoke/test1.json) sets `HF_HUB_OFFLINE` in `container_env`.
+From Hugging Face Hub when **`HF_HUB_OFFLINE=1`** is set in **`environment`** (or legacy `container_env`) **and** the model is not fully cached under your mount.
 
-- **Offline / air-gapped**: pre-download the model snapshot into the host directory you mount (same tree Hub would use under `HF_HOME` / `HF_HOME` inside the container), or remove `HF_HUB_OFFLINE` only after the cache is complete.
-- **Online**: remove `HF_HUB_OFFLINE` from `container_env` (or set `HF_HUB_OFFLINE=0`) so vLLM can download.
+- **Offline**: pre-populate the cache under the host path you bind into the container.
+- **Online**: set **`HF_HUB_OFFLINE`** to `0` or remove it from **`environment`**.
 
 ### Wrong or missing model files in the container
 
-Ensure **`HF_HOME`** in JSON or `launch_env` is the exact string you want for **`podman run -v`** (usually `host:container`). On the host, the mounted path must contain the Hub cache layout the model id expects; inside the container, **`HF_HOME`** is set from **`HF_HOME_CONTAINER`** (often `/models`).
+Ensure **`hf_home`** is the exact **`host:container`** string for **`podman run -v`**, and **`hf_home_container`** matches the in-container layout Hub/vLLM expect (often `/models`). Inner **`HF_HOME`** in the container is set from **`hf_home_container`**, not from a bind string in **`environment`**.
 
 ## Useful CLI flags
 
-- **`--run-podman-script`**: explicit `run_podman.sh`.
 - **`--guidellm-bin`**: explicit GuideLLM binary.
 - **`--container-runtime`**: `podman` or `docker` (or env `CONTAINER_RUNTIME`).
 - **`--server-numa` / `--client-numa`**: NUMA node for vLLM vs GuideLLM client.
 - **`--kv-cache-gb`**: integer GiB for `VLLM_CPU_KVCACHE_SPACE`.
 - **`--ready-timeout`**: seconds to wait for `/health` or `/v1/models`.
+- **`--extra-env-file`**: host file of `KEY=value` lines merged into container env.
+- **`--extra-docker-run-file`**: extra `run` argv lines (before `-v`).
 - **`--dashboard-csv`**: append dashboard-format rows to a shared CSV (each run still writes `dashboard_benchmark.csv` under its run directory when GuideLLM JSON exists).
 - **`--import-script`**, **`--dashboard-version`**, **`--dashboard-tp`**, **`--dashboard-accelerator`**, **`--dashboard-guidellm-version`**: passed through to the dashboard import helper.
 
@@ -251,4 +192,4 @@ Run `python3 cpu_vllm_bench.py --help` for the full list.
 
 ## Artifacts per run
 
-Under each run directory (under `--output-base` / `output_dir` + run slug): GuideLLM JSON and logs, `run_config.json`, `run_manifest.json`, `podman_launch_preview.txt` (orchestrator env + reconstructed container CLI), `vllm_server.log`, `host_samples.tsv`, system capture files, optional `dashboard_benchmark.csv` and PNG graphs.
+Under each run directory (`output_dir` / `--output-base` + run slug): GuideLLM JSON and logs, `run_config.json`, `run_manifest.json`, `podman_launch_preview.txt` (full argv), `container_environment_resolved.env` (redacted), `vllm_server.log`, `host_samples.tsv`, system capture files, optional `dashboard_benchmark.csv` and PNG graphs.

@@ -1,41 +1,44 @@
 # Code map: `cpu_vllm_bench.py`
 
-This document describes how the orchestrator is structured so you can change behavior without reading the whole file.
+How the orchestrator is structured so you can change behavior without reading the whole file.
 
 ## Entry and modes
 
 - **`main()`** — Parses CLI (`parse_args()`), then either:
   - **`run_suite_from_json_path()`** for each `--config` file, or
   - Builds a one-off `cfg` dict from CLI defaults and calls **`single_benchmark()`**.
-- **`single_benchmark()`** — Calls **`resolve_run()`**, validates `run_podman_script` and `guidellm_bin`, enables **`tee_stdout_stderr_to_run_dir()`**, then **`execute_benchmark_phase()`** and **`finalize_after_benchmark()`**.
+- **`single_benchmark()`** — Calls **`resolve_run()`**, checks the container runtime is on `PATH` (`shutil.which`), validates **`guidellm_bin`**, enables **`tee_stdout_stderr_to_run_dir()`**, then **`execute_benchmark_phase()`** and **`finalize_after_benchmark()`**.
 
 ## Configuration resolution
 
-- **`resolve_run(cfg, args)`** — Single source of truth for a run. Reads benchmark fields from `cfg` with fallbacks to `args`. Important paths and env:
-  - **`hf_home`** / **`hf_home_container`** — Passed through to `run_podman.sh` as `HF_HOME` (the **`-v`** bind string) and `HF_HOME_CONTAINER` (inner `HF_HOME`). Values are **not** rewritten; optional **`launch_env`** entries `HF_HOME` / `HF_HOME_CONTAINER` override the top-level JSON keys after merge.
-  - **`launch_env`** — Merged from `defaults.launch_env`, suite-root `launch_env`, and per-run `launch_env` via **`merge_launch_env_from_json_layers()`**, then applied in **`resolve_run()`** with **`podman_env.update(launch_env_user)`** (after which `DETACHED`, `REPLACE_CONTAINER`, and `CONTAINER_NAME` are forced for orchestration).
-  - Suite JSON shallow merge: `defaults` → suite-level keys (`guidellm_*`, `run_podman_script`, **`hf_home`**, …) → each **`runs`** entry; **`launch_env`** uses the separate deep merge above.
-- **`ResolvedRun`** — Immutable-ish snapshot used for the rest of the pipeline (`run_dir`, `podman_env`, `guidellm_bin`, etc.).
+- **`resolve_run(cfg, args)`** — Single source of truth for a run. Reads benchmark fields from `cfg` with fallbacks to `args`.
+  - **`hf_home`** / **`hf_home_container`** — JSON or CLI; used for **`podman|docker run -v ${hf_home}`** and **`-e HF_HOME=${hf_home_container}`** (after merges). Optional **`launch_env`** keys **`HF_HOME`** / **`HF_HOME_CONTAINER`** override those two when merged via **`merge_launch_env_from_json_layers()`**.
+  - **`environment`** (canonical), plus deprecated **`container_env`**, plus **`launch_env`** except `HF_HOME` / `HF_HOME_CONTAINER`, are merged across suite layers by **`merge_environment_from_json_layers()`** into **`cfg["environment"]`**. Per-run resolution uses **`resolved_json_environment(cfg)`**.
+  - **`effective_container_env()`** — Applies optional **`extra_env_file`**, then JSON env, then **forces** orchestrator values: `VLLM_CPU_KVCACHE_SPACE` (from `kv_cache_gb`), inner `HF_HOME`, `VLLM_CPU_OMP_THREADS_BIND`, and optional `CPU_VISIBLE_MEMORY_NODES` / `OMP_NUM_THREADS` from dedicated JSON/CLI fields.
+  - Suite shallow merge: `defaults` → suite-level tooling keys (`guidellm_*`, `run_podman_script` passthrough, `hf_home`, …) → each **`runs`** entry. Then **`merge_launch_env_from_json_layers()`** sets merged **`launch_env`**, and **`merge_environment_from_json_layers()`** sets merged **`environment`**; **`container_env`** is removed from the merged dict after folding so **`run_config.json`** does not duplicate env.
+- **`ResolvedRun`** — Dataclass snapshot: `run_dir`, `container_env` (final `-e` map), `environment_from_json` (pre-override JSON merge), `extra_docker_run_argv`, `vllm_use_image_entrypoint`, `guidellm_bin`, etc. No `podman_env` or `run_podman_script`.
 
 ## Benchmark phase (container + GuideLLM)
 
 - **`execute_benchmark_phase()`** — Order of operations:
   1. Write **`run_config.json`** (input `cfg`).
-  2. **`materialize_merged_extra_env()`** — If JSON `container_env` is set, may write `container_extra_env_merged.env` and set `podman_env["EXTRA_ENV_FILE"]`.
-  3. Write **`run_manifest.json`** (resolved fields + `podman_launch_env`).
+  2. **`write_resolved_environment_artifact()`** — Writes redacted **`container_environment_resolved.env`** under `run_dir`.
+  3. Write **`run_manifest.json`** (resolved fields, redacted env, **`container_run_argv`** one-liner).
   4. **`capture_system_pre_run_snapshot()`** — `lscpu`, `numactl`, `free`, etc.
-  5. **`log_podman_launch_preview()`** — Prints and writes **`podman_launch_preview.txt`** (orchestrator env + reconstructed `podman run` line; see below).
-  6. **`run_podman_detached()`** — `bash run_podman.sh` with `rr.podman_env` merged into `os.environ`, `cwd` = script directory.
+  5. **`log_podman_launch_preview()`** — Prints and writes **`podman_launch_preview.txt`** (full argv from **`format_podman_launch_preview()`**).
+  6. **`launch_vllm_container()`** — For Docker + replace semantics, **`docker rm -f`** first; then **`subprocess.run`** on **`_numactl_launch_prefix_argv(rr) + build_container_run_argv(rr)`** (no shell, no `run_podman.sh`).
   7. **`start_log_follower()`** — Streams `podman logs -f` (or docker) to **`vllm_server.log`**.
   8. **`metrics_sampler`** thread — Appends to **`host_samples.tsv`**.
   9. **`wait_for_server()`** — Polls `/health` and `/v1/models`.
   10. **`run_guidellm()`** — `numactl` + GuideLLM CLI; optional **`guidellm_subprocess_env`** merged into the subprocess environment.
   11. On exit: stop sampler, snapshot full container logs, **`stop_container()`**.
 
-## Podman launch preview vs `run_podman.sh`
+## Container argv construction
 
-- **`format_podman_launch_preview()`** / **`_podman_run_argv_from_env()`** / **`_numactl_launch_prefix_argv()`** — Reconstruct the effective **`podman|docker run ...`** argv to match **`run_podman.sh`**. They do **not** expand `EXTRA_ENV_FILE` or `EXTRA_DOCKER_RUN_FILE` line-by-line; comments in the preview note those additions.
-- If you change **`run_podman.sh`**, update these Python helpers (or accept preview drift) so logged commands stay accurate.
+- **`build_container_run_argv()`** — Builds `podman|docker run` arguments: security options, `--shm-size`, port publish, `--name`, podman `--replace`, `-d`, sorted **`-e k=v`** for every entry in **`rr.container_env`**, **`extra_docker_run_argv`** from **`_parse_extra_docker_run_file()`**, **`-v`**, then either **`IMAGE MODEL`** when **`vllm_use_image_entrypoint`** is true, or **`--entrypoint vllm IMAGE serve MODEL`**, then **`shlex.split(vllm_extra_args)`**.
+- **`_numactl_launch_prefix_argv()`** — `numactl --cpunodebind/--membind` from `server_numa`, optionally prefixed with **`taskset -c`** when `server_cpulist` is set.
+
+Changing container flags should be done **here** (and reflected in docs); **`run_podman.sh`** is legacy/manual only.
 
 ## Post-benchmark
 
@@ -49,5 +52,6 @@ This document describes how the orchestrator is structured so you can change beh
 
 ## Related files
 
-- **`run_podman.sh`** — Builds the real container command; documents env vars in its header comments.
-- **`README.md`** — Operator-facing setup, JSON examples, and **`run_podman.sh`** usage examples.
+- **`run_podman.sh`** — Optional manual/ad-hoc launcher; **not** invoked by `cpu_vllm_bench.py`.
+- **[README.md](README.md)** — Operator overview and troubleshooting.
+- **[README_USAGE.md](README_USAGE.md)** — Copy-paste examples (CLI, JSON, smoke configs).
