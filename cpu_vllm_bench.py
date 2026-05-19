@@ -346,13 +346,20 @@ def effective_container_env(
     extra_env_file: Path | None,
     json_environment: dict[str, str] | None,
 ) -> dict[str, str]:
-    """Environment variables passed into the container (-e), for tags and manifest."""
+    """Environment variables passed into the container (-e), for tags and manifest.
+
+    ``VLLM_CPU_OMP_THREADS_BIND`` is only set from ``vllm_omp_threads_bind`` when the
+    merged env (extra env file + JSON) does not already define that variable.
+    """
     env: dict[str, str] = {}
     env.update(parse_extra_env_file(extra_env_file))
     if json_environment:
         env.update(dict(json_environment))
     env["VLLM_CPU_KVCACHE_SPACE"] = str(int(kv_cache_gb))
-    env["VLLM_CPU_OMP_THREADS_BIND"] = vllm_omp_threads_bind
+    # Honor JSON / extra-env-file VLLM_CPU_OMP_THREADS_BIND; only fall back to the
+    # orchestrator field (--vllm-omp-threads-bind / vllm_omp_threads_bind) when unset.
+    if "VLLM_CPU_OMP_THREADS_BIND" not in env:
+        env["VLLM_CPU_OMP_THREADS_BIND"] = vllm_omp_threads_bind
     env["HF_HOME"] = hf_home_container
     if cpu_visible_memory_nodes:
         env["CPU_VISIBLE_MEMORY_NODES"] = str(cpu_visible_memory_nodes)
@@ -1181,6 +1188,7 @@ def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
     except ValueError as e:
         print(str(e), file=sys.stderr)
         raise SystemExit(2) from e
+    vllm_omp = container_env.get("VLLM_CPU_OMP_THREADS_BIND", vllm_omp)
 
     edf = cfg.get("extra_docker_run_file", args.extra_docker_run_file)
     extra_docker_argv = _parse_extra_docker_run_file(
