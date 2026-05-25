@@ -1,0 +1,1582 @@
+#!/usr/bin/env python3
+"""
+vLLM GPU (Podman/Docker) + GuideLLM benchmark orchestrator.
+
+Unlike ``cpu_vllm_bench.py``, this script does not set CPU thread-bind env vars
+(``VLLM_CPU_OMP_THREADS_BIND``, ``OMP_NUM_THREADS``, etc.) or launch the server
+under ``numactl``/``taskset``. The container is started with GPU device passthrough.
+
+Execution order per run:
+  1. Build the container ``run`` argv in Python (no ``run_podman.sh``), print a launch preview,
+     start the detached container, sample metrics, run GuideLLM, stop the container
+     (writes ``run_config.json`` from the suite/CLI config).
+  2. Dashboard CSV: always write ``dashboard_benchmark.csv`` when GuideLLM JSON exists,
+     then optional concurrency graphs (PNG); optionally append to ``--dashboard-csv``.
+  3. Optional: single MLflow upload (tags, params, metrics, artifacts) — last step only.
+
+Suite JSON: put container ``-e`` variables under ``environment`` (merged from defaults,
+suite root, and each run). Legacy keys ``container_env`` and ``launch_env`` are still
+merged into the same container env, except ``HF_HOME`` / ``HF_HOME_CONTAINER`` in
+``launch_env`` — those only set the volume bind / inner path for the orchestrator,
+not as arbitrary ``-e`` values.
+
+Multiple suite files: pass ``--config`` more than once; each file is run to completion in order.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, TextIO
+
+HOME = Path.home()
+_SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_GUIDELLM_BIN = HOME / "guidellm_env" / "bin" / "guidellm"
+
+
+def discover_guidellm_bin() -> Path:
+    """Prefer ``guidellm_env/bin/guidellm`` next to this script, then the home default."""
+    local = _SCRIPT_DIR / "guidellm_env" / "bin" / "guidellm"
+    if local.is_file():
+        return local
+    return DEFAULT_GUIDELLM_BIN
+DEFAULT_IMPORT_SCRIPT = (
+    HOME
+    / "performance-dashboard"
+    / "manual_runs"
+    / "scripts"
+    / "import_manual_runs_json_v2.py"
+)
+
+VMSTAT_KEYS = (
+    "pgpgin",
+    "pgpgout",
+    "pswpin",
+    "pswpout",
+    "pgfault",
+    "pgmajfault",
+    "nr_dirty",
+    "nr_writeback",
+    "workingset_refault_anon",
+    "workingset_activate_anon",
+)
+
+MLFLOW_TAG_VALUE_MAX = 500
+
+# Performance-dashboard format (import_manual_runs_json_v2.py), copied per run for analysis.
+DASHBOARD_CSV_IN_RUN_DIR = "dashboard_benchmark.csv"
+# Passed as --version to import_manual_runs_json_v2.py; override with --dashboard-version.
+DEFAULT_DASHBOARD_IMPORT_VERSION = "vllm-gpu-v0.18.0"
+DEFAULT_VLLM_GPU_IMAGE = "vllm/vllm-openai:v0.18.0"
+
+GRAPH_OUTPUT_TOK = "graph_concurrency_output_tok_per_sec.png"
+GRAPH_ITL = "graph_concurrency_itl.png"
+GRAPH_TTFT = "graph_concurrency_ttft.png"
+
+NVIDIA_SMI_PRE = "system_nvidia_smi_pre.txt"
+NVIDIA_SMI_QUERY_PRE = "system_nvidia_smi_query_pre.txt"
+NVIDIA_SMI_POST = "system_nvidia_smi_post.txt"
+NVIDIA_SMI_QUERY_POST = "system_nvidia_smi_query_post.txt"
+
+
+def _read_vmstat() -> dict[str, int]:
+    out: dict[str, int] = {}
+    with open("/proc/vmstat", encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2 and parts[0] in VMSTAT_KEYS:
+                out[parts[0]] = int(parts[1])
+    return out
+
+
+def _host_cpu_idle_total() -> tuple[int, int]:
+    """Aggregate ``cpu`` line from ``/proc/stat``: (idle+iowait jiffies, total jiffies)."""
+    with open("/proc/stat", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("cpu ") and not line.startswith("cpu0"):
+                parts = line.split()
+                nums = [int(x) for x in parts[1:]]
+                if len(nums) < 4:
+                    return 0, 0
+                idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+                total = sum(nums)
+                return idle, total
+    return 0, 0
+
+
+def _write_command_capture(path: Path, cmd: list[str], timeout: int = 120) -> None:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        body = f"# command: {' '.join(cmd)}\n# exit_code: {r.returncode}\n\n"
+        body += r.stdout or ""
+        if r.stderr:
+            body += f"\n### stderr ###\n{r.stderr}"
+        path.write_text(body, encoding="utf-8")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        path.write_text(
+            f"# command: {' '.join(cmd)}\n# failed: {type(e).__name__}: {e}\n",
+            encoding="utf-8",
+        )
+
+
+def capture_nvidia_smi_snapshot(run_dir: Path, *, phase: str) -> None:
+    """Capture ``nvidia-smi`` output for MLflow (``phase`` is ``pre`` or ``post``)."""
+    if phase not in ("pre", "post"):
+        raise ValueError(f"phase must be 'pre' or 'post', got {phase!r}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"_{phase}.txt"
+    _write_command_capture(run_dir / f"system_nvidia_smi{suffix}", ["nvidia-smi"])
+    _write_command_capture(
+        run_dir / f"system_nvidia_smi_query{suffix}",
+        ["nvidia-smi", "-q"],
+    )
+
+
+def capture_system_pre_run_snapshot(run_dir: Path) -> None:
+    """Before the benchmark: host CPU/GPU topology and memory (for artifacts and debugging)."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_command_capture(run_dir / "system_lscpu.txt", ["lscpu"])
+    _write_command_capture(run_dir / "system_numactl_hardware.txt", ["numactl", "--hardware"])
+    _write_command_capture(run_dir / "system_numactl_show.txt", ["numactl", "--show"])
+    _write_command_capture(run_dir / "system_free.txt", ["free", "-h"])
+    _write_command_capture(run_dir / "system_uname.txt", ["uname", "-a"])
+    capture_nvidia_smi_snapshot(run_dir, phase="pre")
+
+
+class _TeeText:
+    """Write to multiple text streams (console + run log)."""
+
+    def __init__(self, *streams: TextIO) -> None:
+        self.streams = streams
+
+    def write(self, s: str) -> int:
+        for st in self.streams:
+            st.write(s)
+            st.flush()
+        return len(s)
+
+    def flush(self) -> None:
+        for st in self.streams:
+            st.flush()
+
+    def isatty(self) -> bool:
+        return self.streams[0].isatty() if self.streams else False
+
+
+@contextlib.contextmanager
+def tee_stdout_stderr_to_run_dir(run_dir: Path):
+    """Mirror ``stdout``/``stderr`` to ``run_dir/orchestrator_console.log``."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "orchestrator_console.log"
+    f = open(log_path, "w", encoding="utf-8", errors="replace", buffering=1)  # noqa: SIM115
+    old_out, old_err = sys.stdout, sys.stderr
+    try:
+        sys.stdout = _TeeText(old_out, f)
+        sys.stderr = _TeeText(old_err, f)
+        yield log_path
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        f.close()
+
+
+def metrics_sampler(
+    *,
+    interval_sec: float,
+    out_path: Path,
+    stop_event: threading.Event,
+) -> None:
+    """Sample host CPU utilization (``/proc/stat``) and host ``/proc/vmstat`` counters."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    prev_idle: int | None = None
+    prev_total: int | None = None
+    with open(out_path, "a", encoding="utf-8") as f:
+        f.write(
+            "timestamp_unix\thost_cpu_util_pct\t" + "\t".join(VMSTAT_KEYS) + "\n"
+        )
+        while not stop_event.wait(interval_sec):
+            ts = time.time()
+            host_util = ""
+            try:
+                idle, total = _host_cpu_idle_total()
+                if prev_idle is not None and prev_total is not None:
+                    di = idle - prev_idle
+                    dt = total - prev_total
+                    if dt > 0:
+                        host_util = f"{100.0 * (1.0 - di / dt):.2f}"
+                prev_idle, prev_total = idle, total
+            except OSError:
+                prev_idle, prev_total = None, None
+
+            vm = _read_vmstat()
+            row = [f"{ts:.3f}", host_util] + [
+                str(vm.get(k, "")) for k in VMSTAT_KEYS
+            ]
+            f.write("\t".join(row) + "\n")
+            f.flush()
+
+
+def wait_for_server(base_url: str, timeout_sec: int = 900) -> None:
+    candidates = [
+        f"{base_url.rstrip('/')}/health",
+        f"{base_url.rstrip('/')}/v1/models",
+    ]
+    deadline = time.time() + timeout_sec
+    last_err: str | None = None
+    while time.time() < deadline:
+        for url in candidates:
+            try:
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        return
+            except urllib.error.HTTPError as e:
+                last_err = f"{url}: HTTP {e.code}"
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{url}: {e!s}"
+        time.sleep(2)
+    raise TimeoutError(f"vLLM did not become ready in {timeout_sec}s: {last_err}")
+
+
+def slug(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s).strip("_")[:120]
+
+
+def parse_extra_env_file(path: Path | None) -> dict[str, str]:
+    if path is None or not path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _redact_launch_env_for_manifest(env: dict[str, str]) -> dict[str, str]:
+    """Avoid writing raw tokens into ``run_manifest.json``."""
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        ku = k.upper()
+        if "TOKEN" in ku or "SECRET" in ku or "PASSWORD" in ku:
+            out[k] = "***"
+        else:
+            out[k] = v
+    return out
+
+
+def merge_launch_env_from_json_layers(
+    defaults: dict[str, Any],
+    suite_root: dict[str, Any],
+    run_layer: dict[str, Any],
+) -> dict[str, str]:
+    """Merge ``launch_env`` objects from defaults, suite root, and run (later wins).
+
+    Used for ``HF_HOME`` / ``HF_HOME_CONTAINER`` overrides (volume bind and inner cache path).
+    Other ``launch_env`` keys are also folded into the container ``environment`` merge
+    (see ``_layer_environment_for_container``) except those two bind-related keys.
+    """
+    out: dict[str, str] = {}
+    for d in (defaults, suite_root, run_layer):
+        raw = d.get("launch_env")
+        if isinstance(raw, dict):
+            out.update({str(k): str(v) for k, v in raw.items()})
+    return out
+
+
+def _layer_environment_for_container(d: dict[str, Any]) -> dict[str, str]:
+    """One JSON object: ``environment``, ``container_env``, and non-bind ``launch_env`` keys."""
+    out: dict[str, str] = {}
+    for key in ("environment", "container_env"):
+        raw = d.get(key)
+        if isinstance(raw, dict):
+            out.update({str(k): str(v) for k, v in raw.items()})
+    le = d.get("launch_env")
+    if isinstance(le, dict):
+        for k, v in le.items():
+            ks = str(k)
+            if ks in ("HF_HOME", "HF_HOME_CONTAINER"):
+                continue
+            out[ks] = str(v)
+    return out
+
+
+def merge_environment_from_json_layers(
+    defaults: dict[str, Any],
+    suite_root: dict[str, Any],
+    run_layer: dict[str, Any],
+) -> dict[str, str]:
+    """Merge container ``-e`` variables: defaults, suite root, run (later wins)."""
+    out: dict[str, str] = {}
+    for d in (defaults, suite_root, run_layer):
+        out.update(_layer_environment_for_container(d))
+    return out
+
+
+def resolved_json_environment(cfg: dict[str, Any]) -> dict[str, str]:
+    """Effective JSON-sourced container env for a single merged run config."""
+    env = cfg.get("environment")
+    if isinstance(env, dict) and env:
+        return {str(k): str(v) for k, v in env.items()}
+    return _layer_environment_for_container(cfg)
+
+
+def effective_container_env(
+    *,
+    hf_home_container: str,
+    extra_env_file: Path | None,
+    json_environment: dict[str, str] | None,
+) -> dict[str, str]:
+    """Environment variables passed into the GPU container (-e)."""
+    env: dict[str, str] = {}
+    env.update(parse_extra_env_file(extra_env_file))
+    if json_environment:
+        env.update(dict(json_environment))
+    if "HF_HOME" not in env:
+        env["HF_HOME"] = hf_home_container
+    return env
+
+
+def build_auto_mlflow_tags(
+    *,
+    model: str,
+    isl: int,
+    osl: int,
+    rate: str,
+    gpus: str,
+    port: int,
+    vllm_image: str,
+    vllm_extra_args: str,
+    container_name: str,
+    shm_size: str,
+    hf_home: str,
+    hf_home_container: str,
+    container_runtime: str,
+    max_seconds: int,
+    container_env: dict[str, str],
+    processor: str,
+) -> dict[str, str]:
+    """Tags derived from benchmark + container configuration (no user overrides)."""
+    tags: dict[str, str] = {
+        "benchmark.isl": str(isl),
+        "benchmark.osl": str(osl),
+        "benchmark.rate": rate,
+        "benchmark.model": model,
+        "benchmark.processor": processor,
+        "benchmark.max_seconds": str(max_seconds),
+        "host.container_runtime": container_runtime,
+        "server.port": str(port),
+        "server.image": vllm_image,
+        "server.container_name": container_name,
+        "server.shm_size": shm_size,
+        "server.hf_home": hf_home,
+        "server.gpus": gpus,
+        "server.vllm_extra_args": _truncate_tag(vllm_extra_args),
+    }
+    for k, v in sorted(container_env.items()):
+        tags[f"container.env.{k}"] = _truncate_tag(v)
+    return tags
+
+
+def _truncate_tag(value: str) -> str:
+    if len(value) <= MLFLOW_TAG_VALUE_MAX:
+        return value
+    return value[: MLFLOW_TAG_VALUE_MAX - 3] + "..."
+
+
+def merge_tags(auto: dict[str, str], user: dict[str, str] | None) -> dict[str, str]:
+    """User tags override auto tags on key collision."""
+    merged = dict(auto)
+    if user:
+        merged.update(user)
+    return merged
+
+
+def dashboard_version_for_import(
+    base_version: str,
+    mlflow_tags: dict[str, str] | None,
+) -> str:
+    """If ``mlflow_tags`` contains a non-empty ``project`` tag, append it to ``--version`` for the dashboard import script."""
+    base = (base_version or "").strip()
+    if not mlflow_tags:
+        return base_version
+    raw = mlflow_tags.get("project")
+    if raw is None:
+        return base_version
+    proj = str(raw).strip()
+    if not proj:
+        return base_version
+    if not base:
+        return proj
+    return f"{base}-{proj}"
+
+
+def _parse_extra_docker_run_file(path: Path | None) -> list[str]:
+    """Lines from ``extra_docker_run_file``: each non-comment line split with ``shlex`` (before ``-v``)."""
+    if path is None or not path.is_file():
+        return []
+    argv_extra: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        argv_extra.extend(shlex.split(line))
+    return argv_extra
+
+
+def _gpu_run_device_argv(runtime: str, gpus: str) -> list[str]:
+    """Map ``--gpus`` to runtime-specific device flags."""
+    spec = (gpus or "all").strip()
+    if not spec or spec.lower() == "none":
+        return []
+    if runtime == "docker":
+        return ["--gpus", spec]
+    # Podman: CDI device name (e.g. all -> nvidia.com/gpu=all)
+    if "=" in spec or spec.startswith("nvidia.com/"):
+        return ["--device", spec]
+    return ["--device", f"nvidia.com/gpu={spec}"]
+
+
+def build_container_run_argv(rr: ResolvedRun) -> list[str]:
+    """``podman|docker run ...`` argv (detached, ``--replace`` for podman)."""
+    rt = rr.container_runtime
+    parts: list[str] = [
+        rt,
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        "--security-opt",
+        "seccomp=unconfined",
+        "--security-opt=label=disable",
+        f"--shm-size={rr.shm_size}",
+        "-p",
+        f"{rr.port}:8000",
+        "--name",
+        rr.container_name,
+    ]
+    parts.extend(_gpu_run_device_argv(rt, rr.gpus))
+    if rt == "podman":
+        parts.append("--replace")
+    parts.append("-d")
+    for k, v in sorted(rr.container_env.items()):
+        parts += ["-e", f"{k}={v}"]
+    parts.extend(rr.extra_docker_run_argv)
+    parts += ["-v", rr.hf_home]
+    if rr.vllm_use_image_entrypoint:
+        parts += [rr.vllm_image, rr.model]
+    else:
+        parts += ["--entrypoint", "vllm", rr.vllm_image, "serve", rr.model]
+    extra = (rr.vllm_extra or "").strip()
+    if extra:
+        parts.extend(shlex.split(extra))
+    return parts
+
+
+def launch_vllm_container(rr: ResolvedRun) -> None:
+    """Container runtime ``run -d`` (no ``numactl``/``taskset``)."""
+    rt = rr.container_runtime
+    if rt == "docker":
+        subprocess.run(
+            [rt, "rm", "-f", rr.container_name],
+            capture_output=True,
+            text=True,
+        )
+    argv = build_container_run_argv(rr)
+    subprocess.run(argv, check=True)
+
+
+def format_podman_launch_preview(rr: ResolvedRun) -> str:
+    """Human-readable full argv used to start the server container."""
+    lines: list[str] = []
+    lines.append("=== Container launch (Python-built argv) ===")
+    argv = build_container_run_argv(rr)
+    lines.append(shlex.join(argv))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def log_podman_launch_preview(rr: ResolvedRun) -> None:
+    text = format_podman_launch_preview(rr)
+    print(text, flush=True)
+    preview_path = rr.run_dir / "podman_launch_preview.txt"
+    preview_path.write_text(text, encoding="utf-8")
+
+
+def start_log_follower(
+    *,
+    runtime: str,
+    container_name: str,
+    log_path: Path,
+) -> subprocess.Popen[bytes]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(log_path, "ab")  # noqa: SIM115
+    return subprocess.Popen(
+        [runtime, "logs", "-f", container_name],
+        stdout=fh,
+        stderr=subprocess.STDOUT,
+        cwd="/",
+    )
+
+
+def snapshot_container_logs(
+    runtime: str,
+    container_name: str,
+    out_path: Path,
+) -> bool:
+    """Full container stdout/stderr from `podman logs` / `docker logs` (while container still exists)."""
+    try:
+        r = subprocess.run(
+            [runtime, "logs", container_name],
+            capture_output=True,
+            timeout=300,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    if r.returncode != 0:
+        return False
+    chunks: list[bytes] = []
+    if r.stdout:
+        chunks.append(r.stdout)
+    if r.stderr:
+        chunks.append(b"\n### container stderr (from logs) ###\n")
+        chunks.append(r.stderr)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(b"".join(chunks))
+    return True
+
+
+def stop_container(runtime: str, container_name: str, grace_sec: int = 45) -> None:
+    subprocess.run(
+        [runtime, "stop", "-t", str(grace_sec), container_name],
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_guidellm(
+    *,
+    guidellm_bin: Path,
+    target: str,
+    model: str,
+    processor: str,
+    isl: int,
+    osl: int,
+    rate: str,
+    max_seconds: int,
+    output_dir: Path,
+    output_name: str,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    data = json.dumps({"prompt_tokens": isl, "output_tokens": osl})
+    cmd = [
+        str(guidellm_bin),
+        "benchmark",
+        "--target",
+        target,
+        "--model",
+        model,
+        "--processor",
+        processor,
+        "--data",
+        data,
+        "--rate-type",
+        "concurrent",
+        "--rate",
+        rate,
+        "--backend-kwargs",
+        '{"timeout":1200}',
+        "--max-seconds",
+        str(max_seconds),
+        "--output-dir",
+        str(output_dir),
+        "--outputs",
+        output_name,
+    ]
+    print("Running:", " ".join(cmd), flush=True)
+    out_log = output_dir / "guidellm.stdout.log"
+    err_log = output_dir / "guidellm.stderr.log"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_env = {**os.environ, **(extra_env or {})}
+    with open(out_log, "w", encoding="utf-8", errors="replace") as out_f, open(
+        err_log, "w", encoding="utf-8", errors="replace"
+    ) as err_f:
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=out_f,
+            stderr=err_f,
+            text=True,
+            env=run_env,
+        )
+    print(f"GuideLLM logs: {out_log} , {err_log}", flush=True)
+
+
+def build_runtime_args_string(
+    *,
+    gpus: str,
+    vllm_extra_args: str,
+    port: int,
+) -> str:
+    return "; ".join(
+        [
+            f"gpus: {gpus}",
+            f"port: {port}",
+            f"vllm_extra: {vllm_extra_args}",
+        ]
+    )
+
+
+def guidellm_json_to_mlflow_metrics(json_path: Path) -> dict[str, float]:
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    benchmarks = data.get("benchmarks") or []
+    if not benchmarks:
+        return {}
+    b = benchmarks[0]
+    metrics = b.get("metrics") or {}
+    out: dict[str, float] = {}
+
+    def grab(path: list[str], key: str, prefix: str) -> None:
+        cur: Any = metrics
+        for p in path:
+            cur = cur.get(p) or {}
+        if not isinstance(cur, dict):
+            return
+        v = cur.get(key)
+        if isinstance(v, (int, float)):
+            out[f"{prefix}_{key}"] = float(v)
+        perc = cur.get("percentiles") or {}
+        if isinstance(perc, dict):
+            for pk, pv in perc.items():
+                if isinstance(pv, (int, float)):
+                    out[f"{prefix}_p_{pk}"] = float(pv)
+
+    grab(["output_tokens_per_second", "total"], "mean", "out_tok_per_sec")
+    grab(["tokens_per_second", "total"], "mean", "total_tok_per_sec")
+    grab(["requests_per_second", "successful"], "mean", "rps")
+    grab(["time_to_first_token_ms", "successful"], "median", "ttft_ms")
+    grab(["time_per_output_token_ms", "successful"], "median", "tpot_ms")
+    grab(["inter_token_latency_ms", "successful"], "median", "itl_ms")
+    grab(["request_latency", "successful"], "median", "request_latency_s")
+    return out
+
+
+def build_mlflow_params(
+    *,
+    model: str,
+    isl: int,
+    osl: int,
+    rate: str,
+    gpus: str,
+    vllm_extra_args: str,
+    vllm_image: str,
+    port: int,
+    max_seconds: int,
+    processor: str,
+) -> dict[str, str]:
+    return {
+        "model": model,
+        "processor": processor,
+        "isl": str(isl),
+        "osl": str(osl),
+        "rate": rate,
+        "gpus": gpus,
+        "vllm_extra_args": vllm_extra_args,
+        "vllm_image": vllm_image,
+        "port": str(port),
+        "max_seconds": str(max_seconds),
+    }
+
+
+def append_dashboard_csv(
+    *,
+    import_script: Path,
+    json_path: Path,
+    csv_path: Path,
+    model: str,
+    version: str,
+    tp: int,
+    accelerator: str,
+    runtime_args: str,
+    image_tag: str,
+    guidellm_version: str,
+) -> None:
+    if not import_script.is_file():
+        print(f"Dashboard import script missing: {import_script}", file=sys.stderr)
+        return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        str(import_script),
+        str(json_path),
+        "--model",
+        model,
+        "--version",
+        version,
+        "--tp",
+        str(tp),
+        "--accelerator",
+        accelerator,
+        "--runtime-args",
+        runtime_args,
+        "--image-tag",
+        image_tag,
+        "--guidellm-version",
+        guidellm_version,
+        "--csv-file",
+        str(csv_path),
+    ]
+    subprocess.run(cmd, check=False)
+
+
+def upload_mlflow_run(
+    *,
+    tracking_uri: str | None,
+    experiment: str,
+    run_name: str,
+    tags: dict[str, str],
+    params: dict[str, str],
+    metrics: dict[str, float],
+    artifacts: list[Path],
+) -> None:
+    """Final step: one MLflow run with tags, params, metrics, then artifacts."""
+    try:
+        import mlflow
+        from mlflow.exceptions import MlflowException
+        from mlflow.tracking import MlflowClient
+    except ImportError:
+        print("mlflow not installed; skip upload. pip install mlflow", file=sys.stderr)
+        return
+
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+
+    resolved_uri = mlflow.get_tracking_uri()
+    print(f"MLflow tracking URI (resolved): {resolved_uri}", flush=True)
+    if not tracking_uri and resolved_uri.startswith("file:"):
+        print(
+            "Note: logging to a local file store. The mlflow UI only shows these runs if the "
+            "server was started with the same backend, or you open the UI that serves this path. "
+            "Prefer: export MLFLOW_TRACKING_URI=http://127.0.0.1:5000 matching `mlflow server`.",
+            file=sys.stderr,
+        )
+
+    client = MlflowClient()
+    try:
+        mlflow.set_experiment(experiment)
+        exp_obj = client.get_experiment_by_name(experiment)
+        if exp_obj is None:
+            raise RuntimeError(f"Could not create or resolve experiment {experiment!r}")
+        experiment_id = exp_obj.experiment_id
+    except MlflowException as e:
+        print(f"MLflow experiment error: {e}", file=sys.stderr)
+        raise
+
+    run_uuid: str | None = None
+    try:
+        with mlflow.start_run(run_name=run_name) as active:
+            run_uuid = active.info.run_id
+            for k, v in sorted(tags.items()):
+                if v is None or str(v).strip() == "":
+                    continue
+                mlflow.set_tag(k, _truncate_tag(str(v)))
+            for k, v in sorted(params.items()):
+                if v is None:
+                    continue
+                mlflow.log_param(k, str(v)[:6000])
+            for k, v in sorted(metrics.items()):
+                if isinstance(v, (int, float)) and v == v:
+                    mlflow.log_metric(k, float(v))
+            for path in artifacts:
+                if path.is_file():
+                    try:
+                        mlflow.log_artifact(str(path))
+                    except MlflowException as e:
+                        print(
+                            f"Warning: MLflow log_artifact failed for {path}: {e}",
+                            file=sys.stderr,
+                        )
+                elif path.name == "vllm_server.log":
+                    print(
+                        f"Warning: MLflow artifact missing (no upload): {path}",
+                        file=sys.stderr,
+                    )
+    except MlflowException as e:
+        print(f"MLflow run failed: {e}", file=sys.stderr)
+        raise
+
+    if run_uuid:
+        run = client.get_run(run_uuid)
+        art_uri = run.info.artifact_uri
+        print(
+            f"MLflow: experiment={experiment!r} experiment_id={experiment_id} "
+            f"run_id={run_uuid} artifact_uri={art_uri}",
+            flush=True,
+        )
+        if resolved_uri.startswith("http"):
+            base = resolved_uri.rstrip("/")
+            print(
+                f"MLflow UI (approx): {base}/#/experiments/{experiment_id}/runs/{run_uuid}",
+                flush=True,
+            )
+
+
+@dataclass
+class ResolvedRun:
+    model: str
+    processor: str
+    isl: int
+    osl: int
+    rate: str
+    gpus: str
+    vllm_extra: str
+    vllm_image: str
+    port: int
+    max_seconds: int
+    shm_size: str
+    hf_home: str
+    hf_home_container: str
+    run_id: str
+    run_dir: Path
+    out_json: str
+    container_name: str
+    container_runtime: str
+    # Final ``-e`` map (JSON + optional env file + orchestrator overrides).
+    container_env: dict[str, str]
+    # JSON merge only (``environment`` / ``container_env`` / non-bind ``launch_env``).
+    environment_from_json: dict[str, str]
+    extra_docker_run_argv: list[str]
+    vllm_use_image_entrypoint: bool
+    guidellm_bin: Path
+    guidellm_subprocess_env: dict[str, str]
+    launch_env_user: dict[str, str]
+    experiment: str
+    run_name_ml: str
+    user_mlflow_tags: dict[str, str] = field(default_factory=dict)
+    extra_env_file_path: Path | None = None
+    dashboard_version: str = DEFAULT_DASHBOARD_IMPORT_VERSION
+
+
+def _parse_guidellm_env(cfg: dict[str, Any]) -> dict[str, str]:
+    raw = cfg.get("guidellm_env")
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    return {}
+
+
+def _resolve_guidellm_bin(cfg: dict[str, Any], args: argparse.Namespace) -> Path:
+    if cfg.get("guidellm_bin"):
+        return Path(str(cfg["guidellm_bin"])).expanduser()
+    if cfg.get("guidellm_venv"):
+        return Path(str(cfg["guidellm_venv"])).expanduser() / "bin" / "guidellm"
+    return Path(args.guidellm_bin).expanduser()
+
+
+def _truncate_for_plot(s: str, max_len: int) -> str:
+    s = s.strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
+def dashboard_plot_context_text(rr: ResolvedRun) -> str:
+    """Subtitle lines for benchmark graphs (ISL/OSL, GPU, vLLM args)."""
+    lines = [
+        f"ISL={rr.isl}  OSL={rr.osl}  |  GPUs={rr.gpus}",
+        f"Model: {rr.model}",
+    ]
+    if rr.vllm_extra:
+        lines.append(f"vLLM args: {_truncate_for_plot(rr.vllm_extra, 200)}")
+    lines.append(f"Image: {rr.vllm_image}")
+    return "\n".join(lines)
+
+
+def write_dashboard_benchmark_plots(*, csv_path: Path, rr: ResolvedRun) -> None:
+    """Build concurrency vs latency/throughput PNGs from ``dashboard_benchmark.csv``."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except ImportError:
+        print(
+            "matplotlib and pandas are required for dashboard graphs; "
+            "install with: pip install matplotlib pandas",
+            file=sys.stderr,
+        )
+        return
+
+    if not csv_path.is_file():
+        return
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:  # noqa: BLE001
+        print(f"Could not read {csv_path} for plots: {e}", file=sys.stderr)
+        return
+
+    if df.empty:
+        print("dashboard_benchmark.csv is empty; skip graphs.", file=sys.stderr)
+        return
+
+    x_col = "intended concurrency"
+    if x_col not in df.columns or df[x_col].isna().all():
+        x_col = "measured concurrency"
+    if x_col not in df.columns:
+        print("No concurrency column in dashboard CSV; skip graphs.", file=sys.stderr)
+        return
+
+    df = df.copy()
+    df[x_col] = pd.to_numeric(df[x_col], errors="coerce")
+    df = df.dropna(subset=[x_col])
+    if df.empty:
+        print("No numeric concurrency values; skip graphs.", file=sys.stderr)
+        return
+
+    df = df.sort_values(x_col)
+    ctx = dashboard_plot_context_text(rr)
+    out_dir = rr.run_dir
+    written: list[str] = []
+
+    def _finish_figure(fig: Any, ax: Any, ylabel: str, title: str) -> None:
+        ax.set_xlabel("Concurrency")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+        fig.subplots_adjust(bottom=0.28, top=0.92)
+        fig.text(
+            0.5,
+            0.06,
+            ctx,
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            family="monospace",
+        )
+
+    # Graph 1: output tok/s
+    y1 = "output_tok/sec"
+    if y1 in df.columns:
+        s1 = pd.to_numeric(df[y1], errors="coerce")
+        fig, ax = plt.subplots(figsize=(9, 6.5))
+        ax.plot(df[x_col], s1, marker="o", linestyle="-", color="C0", label=y1)
+        _finish_figure(fig, ax, "Output tokens / sec", "Concurrency vs throughput")
+        fig.savefig(out_dir / GRAPH_OUTPUT_TOK, dpi=150)
+        plt.close(fig)
+        written.append(GRAPH_OUTPUT_TOK)
+
+    # Graph 2: ITL (ms)
+    itl_cols = ["itl_median", "itl_p95", "itl_p99"]
+    present_itl = [c for c in itl_cols if c in df.columns]
+    if present_itl:
+        fig, ax = plt.subplots(figsize=(9, 6.5))
+        for c in present_itl:
+            ax.plot(
+                df[x_col],
+                pd.to_numeric(df[c], errors="coerce"),
+                marker="o",
+                linestyle="-",
+                label=c,
+            )
+        _finish_figure(
+            fig, ax, "ITL (ms)", "Concurrency vs inter-token latency"
+        )
+        fig.savefig(out_dir / GRAPH_ITL, dpi=150)
+        plt.close(fig)
+        written.append(GRAPH_ITL)
+
+    # Graph 3: TTFT (seconds)
+    ttft_cols = ["ttft_median", "ttft_p95", "ttft_p99"]
+    present_ttft = [c for c in ttft_cols if c in df.columns]
+    if present_ttft:
+        fig, ax = plt.subplots(figsize=(9, 6.5))
+        for c in present_ttft:
+            sec = pd.to_numeric(df[c], errors="coerce") / 1000.0
+            ax.plot(df[x_col], sec, marker="o", linestyle="-", label=f"{c} (s)")
+        _finish_figure(fig, ax, "TTFT (s)", "Concurrency vs time to first token")
+        fig.savefig(out_dir / GRAPH_TTFT, dpi=150)
+        plt.close(fig)
+        written.append(GRAPH_TTFT)
+
+    if written:
+        print(
+            f"Wrote benchmark graph(s) under {out_dir}: {', '.join(written)}",
+            flush=True,
+        )
+
+
+def _parse_env_file_lines(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def write_resolved_environment_artifact(rr: ResolvedRun) -> None:
+    """Write ``container_environment_resolved.env`` (redacted copy for logs / MLflow)."""
+    path = rr.run_dir / "container_environment_resolved.env"
+    red = _redact_launch_env_for_manifest(rr.container_env)
+    body = "\n".join(f"{k}={v}" for k, v in sorted(red.items())) + "\n"
+    path.write_text(body, encoding="utf-8")
+
+
+def iter_benchmark_artifact_paths(rr: ResolvedRun) -> list[Path]:
+    """Files under ``run_dir`` to attach to MLflow (existing files only)."""
+    gj = rr.run_dir / rr.out_json
+    candidates = [
+        rr.run_dir / "orchestrator_console.log",
+        rr.run_dir / "guidellm.stdout.log",
+        rr.run_dir / "guidellm.stderr.log",
+        rr.run_dir / "system_lscpu.txt",
+        rr.run_dir / "system_numactl_hardware.txt",
+        rr.run_dir / "system_numactl_show.txt",
+        rr.run_dir / "system_free.txt",
+        rr.run_dir / "system_uname.txt",
+        rr.run_dir / NVIDIA_SMI_PRE,
+        rr.run_dir / NVIDIA_SMI_QUERY_PRE,
+        rr.run_dir / NVIDIA_SMI_POST,
+        rr.run_dir / NVIDIA_SMI_QUERY_POST,
+        rr.run_dir / "container_environment_resolved.env",
+        rr.run_dir / "vllm_server.log",
+        rr.run_dir / "host_samples.tsv",
+        gj,
+        rr.run_dir / "run_manifest.json",
+        rr.run_dir / "run_config.json",
+        rr.run_dir / "podman_launch_preview.txt",
+        rr.run_dir / DASHBOARD_CSV_IN_RUN_DIR,
+        rr.run_dir / GRAPH_OUTPUT_TOK,
+        rr.run_dir / GRAPH_ITL,
+        rr.run_dir / GRAPH_TTFT,
+    ]
+    return [p for p in candidates if p.is_file()]
+
+
+def resolve_run(cfg: dict[str, Any], args: argparse.Namespace) -> ResolvedRun:
+    model = str(cfg.get("model", args.model))
+    isl = int(cfg.get("isl", args.isl))
+    osl = int(cfg.get("osl", args.osl))
+    rate = str(cfg.get("rate", args.rate))
+    gpus = str(cfg.get("gpus", args.gpus))
+    vllm_extra = str(cfg.get("vllm_extra_args", args.vllm_extra_args))
+    port = int(cfg.get("port", args.port))
+    max_seconds = int(cfg.get("max_seconds", args.max_seconds))
+    shm_size = str(cfg.get("shm_size", args.shm_size))
+    raw_launch = cfg.get("launch_env")
+    launch_env_user: dict[str, str] = {}
+    if isinstance(raw_launch, dict):
+        launch_env_user = {str(k): str(v) for k, v in raw_launch.items()}
+    hf_home = str(
+        launch_env_user.get("HF_HOME")
+        or cfg.get("hf_home")
+        or cfg.get("hf_cache_volume")
+        or args.hf_home
+    ).strip()
+    hf_home_container = str(
+        launch_env_user.get("HF_HOME_CONTAINER")
+        or cfg.get("hf_home_container", args.hf_home_container)
+    ).strip()
+    processor = str(cfg.get("processor", model))
+    vllm_image = str(cfg.get("vllm_image", args.vllm_image))
+
+    run_id = slug(
+        str(
+            cfg.get("run_name")
+            or f"{model}-gpu{slug(gpus)}-isl{isl}-osl{osl}-r{rate}"
+        )
+    )
+    run_dir = Path(str(cfg.get("output_dir") or args.output_base)) / run_id
+    out_json = f"guidellm-isl{isl}-osl{osl}-{slug(rate)}.json"
+    container_name = slug(str(cfg.get("container_name") or f"vllm-orch-{run_id}"))[:120]
+
+    extra_env_path = cfg.get("extra_env_file")
+    if extra_env_path is None and args.extra_env_file:
+        extra_env_path = args.extra_env_file
+    extra_path = Path(extra_env_path) if extra_env_path else args.extra_env_file
+
+    json_env = resolved_json_environment(cfg)
+    environment_from_json = dict(json_env)
+
+    container_env = effective_container_env(
+        hf_home_container=hf_home_container,
+        extra_env_file=extra_path,
+        json_environment=json_env if json_env else None,
+    )
+
+    edf = cfg.get("extra_docker_run_file", args.extra_docker_run_file)
+    extra_docker_argv = _parse_extra_docker_run_file(
+        Path(str(edf)).expanduser() if edf is not None else None
+    )
+    vllm_use_image_entrypoint = bool(cfg.get("vllm_use_image_entrypoint"))
+
+    utags: dict[str, str] = {}
+    cfg_tags = cfg.get("mlflow_tags")
+    if isinstance(cfg_tags, dict):
+        utags = {str(k): str(v) for k, v in cfg_tags.items()}
+    cli_tags = args.mlflow_tags or {}
+    utags = {**utags, **{str(k): str(v) for k, v in cli_tags.items()}}
+
+    dashboard_version = str(cfg.get("dashboard_version", args.dashboard_version))
+
+    guidellm_bin = _resolve_guidellm_bin(cfg, args)
+    guidellm_subprocess_env = _parse_guidellm_env(cfg)
+
+    return ResolvedRun(
+        model=model,
+        processor=processor,
+        isl=isl,
+        osl=osl,
+        rate=rate,
+        gpus=gpus,
+        vllm_extra=vllm_extra,
+        vllm_image=vllm_image,
+        port=port,
+        max_seconds=max_seconds,
+        shm_size=shm_size,
+        hf_home=hf_home,
+        hf_home_container=hf_home_container,
+        run_id=run_id,
+        run_dir=run_dir,
+        out_json=out_json,
+        container_name=container_name,
+        container_runtime=args.container_runtime,
+        container_env=container_env,
+        environment_from_json=environment_from_json,
+        extra_docker_run_argv=extra_docker_argv,
+        vllm_use_image_entrypoint=vllm_use_image_entrypoint,
+        guidellm_bin=guidellm_bin,
+        guidellm_subprocess_env=guidellm_subprocess_env,
+        launch_env_user=dict(launch_env_user),
+        experiment=str(cfg.get("experiment", args.experiment)),
+        run_name_ml=str(cfg.get("run_name", run_id))[:250],
+        user_mlflow_tags=utags,
+        extra_env_file_path=extra_path,
+        dashboard_version=dashboard_version,
+    )
+
+
+def execute_benchmark_phase(
+    rr: ResolvedRun,
+    args: argparse.Namespace,
+    *,
+    run_config: dict[str, Any] | None = None,
+) -> None:
+    rr.run_dir.mkdir(parents=True, exist_ok=True)
+    if run_config is not None:
+        (rr.run_dir / "run_config.json").write_text(
+            json.dumps(run_config, indent=2, default=str),
+            encoding="utf-8",
+        )
+    write_resolved_environment_artifact(rr)
+    manifest = {
+        "run_id": rr.run_id,
+        "model": rr.model,
+        "processor": rr.processor,
+        "isl": rr.isl,
+        "osl": rr.osl,
+        "rate": rr.rate,
+        "gpus": rr.gpus,
+        "vllm_extra_args": rr.vllm_extra,
+        "port": rr.port,
+        "container_name": rr.container_name,
+        "vllm_image": rr.vllm_image,
+        "container_env": _redact_launch_env_for_manifest(rr.container_env),
+        "environment_from_json": _redact_launch_env_for_manifest(rr.environment_from_json),
+        "container_run_argv": shlex.join(build_container_run_argv(rr)),
+        "dashboard_version": rr.dashboard_version,
+        "guidellm_bin": str(rr.guidellm_bin),
+        "guidellm_subprocess_env": rr.guidellm_subprocess_env,
+        "launch_env": _redact_launch_env_for_manifest(rr.launch_env_user),
+    }
+    manifest_path = rr.run_dir / "run_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    capture_system_pre_run_snapshot(rr.run_dir)
+
+    vllm_log = rr.run_dir / "vllm_server.log"
+    metrics_tsv = rr.run_dir / "host_samples.tsv"
+    stop_event = threading.Event()
+    sampler_thread = threading.Thread(
+        target=metrics_sampler,
+        kwargs={
+            "interval_sec": args.sample_interval,
+            "out_path": metrics_tsv,
+            "stop_event": stop_event,
+        },
+        daemon=True,
+    )
+    logs_p: subprocess.Popen[bytes] | None = None
+    try:
+        print("Starting vLLM container...", flush=True)
+        log_podman_launch_preview(rr)
+        launch_vllm_container(rr)
+        time.sleep(1)
+        logs_p = start_log_follower(
+            runtime=rr.container_runtime,
+            container_name=rr.container_name,
+            log_path=vllm_log,
+        )
+        sampler_thread.start()
+        target = f"http://127.0.0.1:{rr.port}"
+        wait_for_server(target, timeout_sec=args.ready_timeout)
+        run_guidellm(
+            guidellm_bin=rr.guidellm_bin,
+            target=target,
+            model=rr.model,
+            processor=rr.processor,
+            isl=rr.isl,
+            osl=rr.osl,
+            rate=rr.rate,
+            max_seconds=rr.max_seconds,
+            output_dir=rr.run_dir,
+            output_name=rr.out_json,
+            extra_env=rr.guidellm_subprocess_env or None,
+        )
+    finally:
+        stop_event.set()
+        sampler_thread.join(timeout=args.sample_interval + 5)
+        if logs_p and logs_p.poll() is None:
+            logs_p.terminate()
+            try:
+                logs_p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logs_p.kill()
+        # Complete vLLM log for MLflow: streaming `logs -f` can truncate on terminate;
+        # refresh from the runtime while the container is still running.
+        ok = snapshot_container_logs(
+            rr.container_runtime, rr.container_name, vllm_log
+        )
+        if not ok:
+            print(
+                "Warning: could not snapshot container logs (file may only contain streamed tail).",
+                file=sys.stderr,
+            )
+        capture_nvidia_smi_snapshot(rr.run_dir, phase="post")
+        stop_container(rr.container_runtime, rr.container_name)
+
+
+def finalize_after_benchmark(rr: ResolvedRun, args: argparse.Namespace) -> None:
+    """Per-run dashboard CSV, optional consolidated CSV, then MLflow (always last)."""
+    gj = rr.run_dir / rr.out_json
+    runtime_args_str = build_runtime_args_string(
+        gpus=rr.gpus,
+        vllm_extra_args=rr.vllm_extra,
+        port=rr.port,
+    )
+
+    if gj.is_file():
+        per_run_dashboard = rr.run_dir / DASHBOARD_CSV_IN_RUN_DIR
+        dash_version = dashboard_version_for_import(
+            rr.dashboard_version,
+            rr.user_mlflow_tags,
+        )
+        print(
+            f"Writing dashboard-format CSV for this run: {per_run_dashboard}",
+            flush=True,
+        )
+        append_dashboard_csv(
+            import_script=args.import_script,
+            json_path=gj,
+            csv_path=per_run_dashboard,
+            model=rr.model,
+            version=dash_version,
+            tp=args.dashboard_tp,
+            accelerator=args.dashboard_accelerator,
+            runtime_args=runtime_args_str,
+            image_tag=rr.vllm_image,
+            guidellm_version=args.dashboard_guidellm_version,
+        )
+        if per_run_dashboard.is_file():
+            write_dashboard_benchmark_plots(csv_path=per_run_dashboard, rr=rr)
+        if args.dashboard_csv:
+            print(
+                f"Appending same rows to consolidated dashboard CSV: {args.dashboard_csv}",
+                flush=True,
+            )
+            append_dashboard_csv(
+                import_script=args.import_script,
+                json_path=gj,
+                csv_path=args.dashboard_csv,
+                model=rr.model,
+                version=dash_version,
+                tp=args.dashboard_tp,
+                accelerator=args.dashboard_accelerator,
+                runtime_args=runtime_args_str,
+                image_tag=rr.vllm_image,
+                guidellm_version=args.dashboard_guidellm_version,
+            )
+
+    mlflow_on = not args.no_mlflow and bool(
+        args.mlflow
+        or args.mlflow_tracking_uri
+        or os.environ.get("MLFLOW_TRACKING_URI")
+    )
+    if not mlflow_on:
+        print(f"Done. Artifacts under {rr.run_dir}", flush=True)
+        return
+
+    auto_tags = build_auto_mlflow_tags(
+        model=rr.model,
+        isl=rr.isl,
+        osl=rr.osl,
+        rate=rr.rate,
+        gpus=rr.gpus,
+        port=rr.port,
+        vllm_image=rr.vllm_image,
+        vllm_extra_args=rr.vllm_extra,
+        container_name=rr.container_name,
+        shm_size=rr.shm_size,
+        hf_home=rr.hf_home,
+        hf_home_container=rr.hf_home_container,
+        container_runtime=rr.container_runtime,
+        max_seconds=rr.max_seconds,
+        container_env=rr.container_env,
+        processor=rr.processor,
+    )
+    tags = merge_tags(auto_tags, rr.user_mlflow_tags)
+    params = build_mlflow_params(
+        model=rr.model,
+        isl=rr.isl,
+        osl=rr.osl,
+        rate=rr.rate,
+        gpus=rr.gpus,
+        vllm_extra_args=rr.vllm_extra,
+        vllm_image=rr.vllm_image,
+        port=rr.port,
+        max_seconds=rr.max_seconds,
+        processor=rr.processor,
+    )
+    metrics = guidellm_json_to_mlflow_metrics(gj) if gj.is_file() else {}
+    artifacts = iter_benchmark_artifact_paths(rr)
+
+    print("Uploading run to MLflow...", flush=True)
+    upload_mlflow_run(
+        tracking_uri=args.mlflow_tracking_uri or os.environ.get("MLFLOW_TRACKING_URI"),
+        experiment=rr.experiment,
+        run_name=rr.run_name_ml,
+        tags=tags,
+        params=params,
+        metrics=metrics,
+        artifacts=artifacts,
+    )
+    print(f"Done. Artifacts under {rr.run_dir}", flush=True)
+
+
+def single_benchmark(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    rr = resolve_run(cfg, args)
+    runtime_bin = shutil.which(rr.container_runtime)
+    if not runtime_bin:
+        print(
+            f"Container runtime {rr.container_runtime!r} not found on PATH",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not rr.guidellm_bin.is_file():
+        print(f"Missing GuideLLM binary {rr.guidellm_bin}", file=sys.stderr)
+        raise SystemExit(1)
+    rr.run_dir.mkdir(parents=True, exist_ok=True)
+    with tee_stdout_stderr_to_run_dir(rr.run_dir):
+        execute_benchmark_phase(rr, args, run_config=cfg)
+        finalize_after_benchmark(rr, args)
+
+
+def run_suite_from_json_path(config_path: Path, args: argparse.Namespace) -> None:
+    """Load one suite JSON and execute every entry in ``runs``."""
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    runs = data.get("runs")
+    if not isinstance(runs, list):
+        print(
+            f"{config_path}: config must contain a 'runs' array",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    global_exp = data.get("experiment", args.experiment)
+    default_tags = data.get("mlflow_tags")
+    if not isinstance(default_tags, dict):
+        default_tags = {}
+    suite_tooling: dict[str, Any] = {}
+    for key in (
+        "guidellm_bin",
+        "guidellm_venv",
+        "guidellm_env",
+        "run_podman_script",
+        "hf_home",
+        "hf_home_container",
+        "hf_cache_volume",
+    ):
+        if key in data:
+            suite_tooling[key] = data[key]
+    defaults_dict = data.get("defaults", {}) or {}
+    for i, run_cfg in enumerate(runs):
+        if not isinstance(run_cfg, dict):
+            continue
+        merged = {**defaults_dict, **suite_tooling, **run_cfg}
+        lev = merge_launch_env_from_json_layers(defaults_dict, data, run_cfg)
+        if lev:
+            merged["launch_env"] = lev
+        env_merged = merge_environment_from_json_layers(defaults_dict, data, run_cfg)
+        if env_merged:
+            merged["environment"] = env_merged
+        merged.pop("container_env", None)
+        merged.setdefault("experiment", global_exp)
+        mtags = {**default_tags}
+        rt = merged.get("mlflow_tags")
+        if isinstance(rt, dict):
+            mtags.update(rt)
+        merged["mlflow_tags"] = mtags
+        print(
+            f"=== [{config_path.name}] Run {i + 1}/{len(runs)}: "
+            f"{merged.get('run_name', merged.get('model'))} ===",
+            flush=True,
+        )
+        single_benchmark(merged, args)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--config",
+        action="append",
+        type=Path,
+        dest="config_files",
+        metavar="FILE",
+        help="Suite JSON with 'runs' list (repeat flag for multiple files, executed in order)",
+    )
+    p.add_argument("--output-base", type=Path, default=HOME / "results" / "vllm_gpu_guidellm_runs")
+
+    p.add_argument(
+        "--guidellm-bin",
+        type=Path,
+        default=discover_guidellm_bin(),
+        help="GuideLLM CLI binary (default: ./guidellm_env/bin/guidellm next to script, else ~/guidellm_env/bin/guidellm)",
+    )
+    p.add_argument("--container-runtime", default=os.environ.get("CONTAINER_RUNTIME", "podman"))
+
+    p.add_argument("--model", default="Qwen/Qwen3-1.7B")
+    p.add_argument("--vllm-image", default=DEFAULT_VLLM_GPU_IMAGE)
+    p.add_argument("--vllm-extra-args", default="--dtype=bfloat16")
+    p.add_argument(
+        "--gpus",
+        default="all",
+        help="GPU spec: docker uses --gpus VALUE; podman uses --device nvidia.com/gpu=VALUE (or full device string)",
+    )
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--shm-size", default="16g")
+    p.add_argument(
+        "--hf-home",
+        default="/home/naveen/models:/models",
+        help="Podman/Docker -v bind (host:container path), used as-is.",
+    )
+    p.add_argument(
+        "--hf-cache-volume",
+        default=None,
+        help="Deprecated. Same as --hf-home (overrides --hf-home if set)",
+    )
+    p.add_argument("--hf-home-container", default="/models")
+
+    p.add_argument("--isl", type=int, default=128)
+    p.add_argument("--osl", type=int, default=128)
+    p.add_argument("--rate", default="1,2")
+    p.add_argument("--max-seconds", type=int, default=450)
+
+    p.add_argument("--sample-interval", type=float, default=5.0)
+    p.add_argument("--ready-timeout", type=int, default=900)
+
+    p.add_argument("--extra-env-file", type=Path, default=None)
+    p.add_argument("--extra-docker-run-file", type=Path, default=None)
+
+    p.add_argument("--experiment", default="vllm-gpu-guidellm")
+    p.add_argument("--run-name", default=None)
+    p.add_argument(
+        "--mlflow-tags",
+        type=json.loads,
+        default=None,
+        help='Extra MLflow tags (JSON object). Override auto tags on same key.',
+    )
+    p.add_argument("--mlflow-tracking-uri", default=None)
+    p.add_argument("--mlflow", action="store_true")
+    p.add_argument("--no-mlflow", action="store_true")
+
+    p.add_argument(
+        "--dashboard-csv",
+        type=Path,
+        default=None,
+        help="Optional consolidated CSV to append to (per-run dashboard_benchmark.csv is always written when GuideLLM JSON exists)",
+    )
+    p.add_argument("--import-script", type=Path, default=DEFAULT_IMPORT_SCRIPT)
+    p.add_argument(
+        "--dashboard-version",
+        default=DEFAULT_DASHBOARD_IMPORT_VERSION,
+        help=(
+            f"Value for import_manual_runs_json_v2.py --version (default: {DEFAULT_DASHBOARD_IMPORT_VERSION!r})"
+        ),
+    )
+    p.add_argument("--dashboard-tp", type=int, default=1)
+    p.add_argument("--dashboard-accelerator", default="GPU")
+    p.add_argument("--dashboard-guidellm-version", default="0.5.x")
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if getattr(args, "hf_cache_volume", None):
+        args.hf_home = args.hf_cache_volume
+
+    if args.config_files:
+        for fi, cfg_path in enumerate(args.config_files):
+            if not cfg_path.is_file():
+                print(f"Config file not found: {cfg_path}", file=sys.stderr)
+                raise SystemExit(1)
+            print(
+                f"########## Suite file {fi + 1}/{len(args.config_files)}: {cfg_path} ##########",
+                flush=True,
+            )
+            run_suite_from_json_path(cfg_path, args)
+    else:
+        cfg = {
+            "model": args.model,
+            "isl": args.isl,
+            "osl": args.osl,
+            "rate": args.rate,
+            "gpus": args.gpus,
+            "vllm_extra_args": args.vllm_extra_args,
+            "port": args.port,
+            "max_seconds": args.max_seconds,
+            "vllm_image": args.vllm_image,
+            "output_dir": str(args.output_base),
+            "experiment": args.experiment,
+            "run_name": args.run_name,
+            "mlflow_tags": args.mlflow_tags or {},
+            "hf_home": args.hf_home,
+            "hf_home_container": args.hf_home_container,
+            "environment": {},
+        }
+        single_benchmark(cfg, args)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    main()
