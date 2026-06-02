@@ -1,0 +1,29 @@
+{
+  "experiment": "gpu-example-multi-run",
+  "defaults": {
+    "output_dir": "./results/gpu/examples",
+    "gpus": "all",
+    "max_seconds": 180,
+    "isl": 128,
+    "osl": 128,
+    "rate": "1,2",
+    "shm_size": "16g",
+    "vllm_image": "vllm/vllm-openai:v0.18.0",
+    "vllm_extra_args": "--dtype=bfloat16 --gpu-memory-utilization 0.90",
+    "hf_home": "/path/on/host/models:/models",
+    "hf_home_container": "/models"
+  },
+  "runs": [
+    {
+      "run_name": "gpu-qwen-1.7b",
+      "model": "Qwen/Qwen3-1.7B",
+      "rate": "1,2,4"
+    },
+    {
+      "run_name": "gpu-qwen-4b",
+      "model": "Qwen/Qwen3-4B",
+      "rate": "1,2",
+      "vllm_extra_args": "--dtype=bfloat16 --gpu-memory-utilization 0.85 --max-model-len 4096"
+    }
+  ]
+}

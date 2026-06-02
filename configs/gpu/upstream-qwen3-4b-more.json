@@ -1,0 +1,90 @@
+{
+  "experiment": "vllm-L4-cpu-benchmarking-3.4-GNR-upstream",
+  "defaults": {
+    "max_seconds": 300,
+    "isl": 128,
+    "osl": 128,
+    "gpus": "0",
+    "rate": "1,2,4,8,16,32,64,128,256",
+    "kv_cache_gb": 64,
+    "vllm_extra_args": "--max-num-batched-tokens 2048 --max-num-seqs 128 --max-model-len 32768",
+    "model": "Qwen/Qwen3-4B",
+    "vllm_image": "vllm/vllm-openai:v0.20.0-cu130",
+    "hf_home": "/mnt/data/models:/models",
+    "hf_home_container": "/models",
+    "dashboard_version": "upstream-v0.20.0",
+    "guidellm_venv": "/mnt/data/guidellmenv",
+    "mlflow_tags": {
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B",
+        "vllm_version": "vllm-v0.20.0-cu130",
+        "hw": "L4"
+    },
+    "environment": {
+      "HF_HUB_OFFLINE": "1",
+      "HF_TOKEN": ""
+    }
+  },
+  "runs": [
+    {
+      "run_name": "upstream-Qwen3-4B-isl-4096",
+      "isl": 4096,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "4096",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "upstream-Qwen3-4B-isl-8192",
+      "isl": 8192,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "8192",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "upstream-Qwen3-4B-isl-16384",
+      "isl": 16384,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "16384",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "upstream-Qwen3-4B-osl-1024",
+      "isl": 16,
+      "osl": 1024,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "1024",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "upstream-Qwen3-4B-osl-2048",
+      "isl": 16,
+      "osl": 2048,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "2048",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    }
+  ]
+}

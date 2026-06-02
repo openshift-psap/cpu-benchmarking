@@ -1,0 +1,25 @@
+{
+  "experiment": "gpu-smoke-two-rates",
+  "defaults": {
+    "output_dir": "./results/gpu/smoke",
+    "gpus": "all",
+    "max_seconds": 60,
+    "isl": 64,
+    "osl": 64,
+    "rate": "1,2",
+    "shm_size": "16g",
+    "vllm_image": "vllm/vllm-openai:v0.18.0",
+    "vllm_extra_args": "--dtype=bfloat16 --max-model-len 1024",
+    "hf_home": "/home/nmiriyal/models:/models",
+    "hf_home_container": "/models",
+    "environment": {
+      "HF_HUB_OFFLINE": "1"
+    }
+  },
+  "runs": [
+    {
+      "run_name": "gpu-smoke-qwen-1.7b-c1-c2",
+      "model": "Qwen/Qwen3-1.7B"
+    }
+  ]
+}

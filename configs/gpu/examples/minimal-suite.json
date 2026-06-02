@@ -1,0 +1,22 @@
+{
+  "experiment": "gpu-example-minimal",
+  "defaults": {
+    "output_dir": "./results/gpu/examples",
+    "gpus": "all",
+    "max_seconds": 120,
+    "isl": 128,
+    "osl": 128,
+    "rate": "1,2,4",
+    "shm_size": "16g",
+    "vllm_image": "vllm/vllm-openai:v0.18.0",
+    "vllm_extra_args": "--dtype=bfloat16",
+    "hf_home": "/path/on/host/models:/models",
+    "hf_home_container": "/models"
+  },
+  "runs": [
+    {
+      "run_name": "gpu-example-qwen-1.7b",
+      "model": "Qwen/Qwen3-1.7B"
+    }
+  ]
+}

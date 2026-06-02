@@ -1,0 +1,26 @@
+{
+  "experiment": "gpu-smoke-minimal",
+  "defaults": {
+    "output_dir": "./results/gpu/smoke",
+    "gpus": "all",
+    "max_seconds": 30,
+    "isl": 32,
+    "osl": 32,
+    "rate": "1",
+    "port": 8000,
+    "shm_size": "16g",
+    "vllm_image": "vllm/vllm-openai:v0.20.0-cu130",
+    "vllm_extra_args": "--dtype=bfloat16 --max-model-len 512",
+    "hf_home": "/mnt/data/models:/models",
+    "hf_home_container": "/models",
+    "environment": {
+      "HF_HUB_OFFLINE": "1"
+    }
+  },
+  "runs": [
+    {
+      "run_name": "gpu-smoke-qwen-1.7b",
+      "model": "Qwen/Qwen3-1.7B"
+    }
+  ]
+}
