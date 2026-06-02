@@ -10,8 +10,14 @@
     "kv_cache_gb": 32,
     "vllm_image": "vllm/vllm-openai-cpu:v0.18.0",
     "vllm_extra_args": "--dtype=bfloat16",
-    "hf_home": "/path/on/host/models:/models",
-    "output_dir": "./results"
+    "hf_home": "/home/nmiriyal/models:/models",
+    "guidellm_venv":"/home/nmiriyal/CPU-BENCHMARK/guidellmenv",
+    "output_dir": "./results",
+    "environment": {
+      "VLLM_CPU_OMP_THREADS_BIND": "96,97,98,99",
+      "HF_HUB_OFFLINE": "1",
+      "CPU_VISIBLE_MEMORY_NODES": "1"
+    }
   },
   "runs": [
     {

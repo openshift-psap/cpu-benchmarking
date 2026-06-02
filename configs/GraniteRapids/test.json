@@ -1,0 +1,39 @@
+{
+  "experiment": "example-minimal",
+  "defaults": {
+    "server_numa": 1,
+    "client_numa": 0,
+    "max_seconds": 100,
+    "isl": 128,
+    "osl": 128,
+    "rate": "1",
+    "kv_cache_gb": 64,
+    "vllm_extra_args": "--dtype=bfloat16",
+    "vllm_image": "quay.io/aipcc/rhaiis/cpu-ubi9:3.4",
+    "hf_home": "/home/nmiriyal/models:/models",
+    "guidellm_venv": "/home/nmiriyal/CPU-BENCHMARK/guidellmenv",
+    "vllm_omp_threads_bind": "96-191",
+    "environment": {
+      "HF_HUB_OFFLINE": "1",
+      "CPU_VISIBLE_MEMORY_NODES": "1",
+      "HF_TOKEN":""
+    }
+  },
+  "runs": [
+    {
+      "run_name": "GNR-upstream-Qwen3-4B-isl-16",
+      "dashboard_version": "upstream-v0.18.0",
+      "model": "Qwen/Qwen3-4B",
+      "vllm_image": "vllm/vllm-openai-cpu:v0.18.0",
+      "isl": 16,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "16",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    }
+  ]
+}

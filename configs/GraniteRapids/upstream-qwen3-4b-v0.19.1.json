@@ -1,0 +1,91 @@
+{
+  "experiment": "vllm-cpu-benchmarking-3.4-GNR-upstream",
+  "defaults": {
+    "server_numa": 1,
+    "client_numa": 0,
+    "max_seconds": 300,
+    "isl": 128,
+    "osl": 128,
+    "rate": "1,2,4,8,16,32",
+    "kv_cache_gb": 64,
+    "vllm_extra_args": "--dtype=bfloat16",
+    "model": "Qwen/Qwen3-4B",
+    "vllm_image": "vllm/vllm-openai-cpu:v0.19.1",
+    "dashboard_version": "upstream-v0.19.1",
+    "hf_home": "/home/nmiriyal/models:/models",
+    "guidellm_venv": "/home/nmiriyal/CPU-BENCHMARK/guidellmenv",
+    "vllm_omp_threads_bind": "96-191",
+    "environment": {
+      "HF_HUB_OFFLINE": "1",
+      "CPU_VISIBLE_MEMORY_NODES": "1",
+      "HF_TOKEN":""
+    }
+  },
+  "runs": [
+    {
+      "run_name": "upstream-Qwen3-4B-isl-4096",
+      "isl": 4096,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "4096",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B",
+	"vllm":"0.19.1"
+      }
+    },
+    {
+      "run_name": "upstream-Qwen3-4B-isl-8192",
+      "isl": 8192,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "8192",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B",
+	"vllm":"0.19.1"
+      }
+    },
+    {
+      "run_name": "upstream-Qwen3-4B-isl-16384",
+      "isl": 16384,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "16384",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B",
+	"vllm":"0.19.1"
+      }
+    },
+    {
+      "run_name": "upstream-Qwen3-4B-osl-1024",
+      "isl": 16,
+      "osl": 1024,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "1024",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B",
+	"vllm":"0.19.1"
+      }
+    },
+    {
+      "run_name": "upstream-Qwen3-4B-osl-2048",
+      "isl": 16,
+      "osl": 2048,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "2048",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B",
+	"vllm":"0.19.1"
+      }
+    }
+  ]
+}
