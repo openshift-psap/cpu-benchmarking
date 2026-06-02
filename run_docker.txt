@@ -1,1 +1,2 @@
 -v /opt/intel:/opt/intel
+-v /lib64/libtcmalloc.so.4:/host-libs/libtcmalloc.so.4
