@@ -1,0 +1,104 @@
+FROM vllm/vllm-openai-cpu:v0.18.0
+
+# Install sed for patching (if not already present)
+USER root
+
+# Patch 1: Force library loading to skip AMX
+# File: vllm/platforms/cpu.py
+# Change: if torch.cpu._is_avx512_bf16_supported():
+# To:     if False:  # AMX disabled
+RUN python3 << 'EOF'
+import os
+
+platform_file = '/opt/venv/lib/python3.12/site-packages/vllm/platforms/cpu.py'
+
+print(f"📝 Patching {platform_file}...")
+
+with open(platform_file, 'r') as f:
+    content = f.read()
+
+# Patch the library loading logic
+original = 'if torch.cpu._is_avx512_bf16_supported():'
+replacement = 'if False:  # AMX disabled - vLLM will load AVX512 or AVX2 library'
+
+if original in content:
+    content = content.replace(original, replacement)
+    with open(platform_file, 'w') as f:
+        f.write(content)
+    print(f"  ✅ Patched library loading (AMX → AVX-512/AVX2)")
+else:
+    print(f"  ⚠️  Pattern not found: {original}")
+    exit(1)
+
+EOF
+
+# Patch 2: Force runtime ISA selection to skip AMX
+# File: vllm/v1/attention/backends/cpu_attn.py
+# Change: supports_amx = torch.cpu._is_amx_tile_supported()
+# To:     supports_amx = False  # AMX disabled
+RUN python3 << 'EOF'
+import os
+
+cpu_attn_file = '/opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/cpu_attn.py'
+
+print(f"📝 Patching {cpu_attn_file}...")
+
+with open(cpu_attn_file, 'r') as f:
+    content = f.read()
+
+# Patch the runtime ISA detection
+original = 'supports_amx = torch.cpu._is_amx_tile_supported()'
+replacement = 'supports_amx = False  # AMX disabled - will use AVX-512 or AVX2'
+
+if original in content:
+    content = content.replace(original, replacement)
+    with open(cpu_attn_file, 'w') as f:
+        f.write(content)
+    print(f"  ✅ Patched runtime ISA selection (AMX → vec)")
+else:
+    print(f"  ⚠️  Pattern not found: {original}")
+    exit(1)
+
+EOF
+
+# Verification: Check both patches were applied
+RUN python3 << 'EOF'
+import sys
+
+platform_file = '/opt/venv/lib/python3.12/site-packages/vllm/platforms/cpu.py'
+cpu_attn_file = '/opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/cpu_attn.py'
+
+print("\n🔍 Verifying patches...")
+
+# Check patch 1
+with open(platform_file, 'r') as f:
+    if 'AMX disabled - vLLM will load AVX512 or AVX2 library' in f.read():
+        print("  ✅ Patch 1 verified (library loading)")
+    else:
+        print("  ❌ Patch 1 failed!")
+        sys.exit(1)
+
+# Check patch 2
+with open(cpu_attn_file, 'r') as f:
+    if 'supports_amx = False  # AMX disabled' in f.read():
+        print("  ✅ Patch 2 verified (runtime ISA)")
+    else:
+        print("  ❌ Patch 2 failed!")
+        sys.exit(1)
+
+print("\n✅ All patches applied successfully!")
+print("   This image will use AVX-512 (or AVX2) instead of AMX\n")
+
+EOF
+
+# Add labels
+LABEL maintainer="Custom vLLM build"
+LABEL description="vLLM v0.18.0 with AMX permanently disabled"
+LABEL isa.amx="disabled"
+LABEL isa.fallback="avx512-or-avx2"
+
+# Switch back to non-root user (if the base image uses one)
+# USER vllm  # Uncomment if base image has vllm user
+
+# Set environment variable to indicate this is a custom build
+ENV VLLM_CUSTOM_BUILD="no-amx"
