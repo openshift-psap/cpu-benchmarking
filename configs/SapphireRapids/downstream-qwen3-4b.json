@@ -1,0 +1,194 @@
+{
+  "experiment": "vllm-cpu-benchmarking-3.4-SPR-Downstream-RHAIIS-3.4GA",
+  "defaults": {
+    "server_numa": 1,
+    "client_numa": 0,
+    "max_seconds": 300,
+    "isl": 128,
+    "osl": 128,
+    "rate": "1,2,4,8,16,32",
+    "kv_cache_gb": 64,
+    "vllm_extra_args": "--dtype=bfloat16",
+    "model": "Qwen/Qwen3-4B",
+    "vllm_image": "quay.io/aipcc/rhaiis/cpu-ubi9:3.4.0-1777218962",
+    "dashboard_version": "RHAIIS-3.4-GA",
+    "hf_home": "/home/naveen/models:/models",
+    "guidellm_venv": "/home/naveen/guidellm_env/",
+    "vllm_omp_threads_bind": "auto",
+    "environment": {
+      "HF_HUB_OFFLINE": "1",
+      "CPU_VISIBLE_MEMORY_NODES": "1",
+      "HF_TOKEN":""
+    }
+  },
+  "runs": [
+    {
+      "run_name": "downstream-Qwen3-4B-isl-16",
+      "isl": 16,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "16",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-isl-32",
+      "isl": 32,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "32",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-isl-64",
+      "isl": 64,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "64",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-isl-128",
+      "isl": 128,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "128",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-isl-256",
+      "isl": 256,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "256",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-isl-512",
+      "isl": 512,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "512",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-isl-1024",
+      "isl": 1024,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "1024",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-isl-2048",
+      "isl": 2048,
+      "osl": 1,
+      "mlflow_tags": {
+        "suite": "isl-sweep",
+        "isl": "2048",
+        "osl": "1",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-osl-16",
+      "isl": 16,
+      "osl": 16,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "16",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-osl-32",
+      "isl": 16,
+      "osl": 32,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "32",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-osl-64",
+      "isl": 16,
+      "osl": 64,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "64",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-osl-128",
+      "isl": 16,
+      "osl": 128,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "128",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-osl-256",
+      "isl": 16,
+      "osl": 256,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "256",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    },
+    {
+      "run_name": "downstream-Qwen3-4B-osl-512",
+      "isl": 16,
+      "osl": 512,
+      "mlflow_tags": {
+        "suite": "osl-sweep",
+        "osl": "512",
+        "isl": "16",
+        "kv_cache_gb": "64",
+        "model": "Qwen3-4B"
+      }
+    }
+  ]
+}
